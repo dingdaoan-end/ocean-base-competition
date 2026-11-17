@@ -10,3 +10,7 @@
 *.i filter=codeformat
 *.ic filter=codeformat
 *.js filter=codeformat
+
+# Preserve the exact UTF-8 evidence bytes across Windows/Linux checkouts.
+/conversation.json -text
+/agent/conversation.json -text
