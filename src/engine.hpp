@@ -33,10 +33,10 @@ public:
   const std::string& back()const{return (*this)[count-1];}
 };
 namespace detail {
-// A bounded table can afford one exact pass for all calibration samples even
-// when its vector payload does not fit. Larger tables retain the I/O guard.
-constexpr bool skip_ivf_calibration_for_payload(uint64_t active_rows,uint64_t payload_bytes,size_t budget_bytes){
-  return active_rows>25000&&payload_bytes>budget_bytes/2;
+// Calibration shares the engine budget with training, cached pages and Undo.
+// Guard by payload size even for bounded tables.
+constexpr bool skip_ivf_calibration_for_payload(uint64_t,uint64_t payload_bytes,size_t budget_bytes){
+  return payload_bytes>budget_bytes/2;
 }
 }
 struct Result {

@@ -294,12 +294,18 @@ const std::byte* BufferPool::resident(ResidentHandle h) const {
   if(h.frame>=frames.size()||!frames[h.frame].valid||frames[h.frame].version!=h.version)return nullptr;
   return pages[h.frame].get();
 }
-void BufferPool::flush_page(const std::string& f,uint64_t p){flush(pin(f,p));}
+void BufferPool::flush_page(const std::string& f,uint64_t p){
+  auto found=lookup.find(f+":"+std::to_string(p));
+  if(found!=lookup.end())flush(found->second);
+}
 void BufferPool::append_extent(const std::string& f,uint64_t p,const Page& bytes,size_t offset,size_t length){
   append_extent_bytes(f,p,offset,bytes.data()+offset,length);
 }
 void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offset,const void* bytes,size_t length){
-  auto i=pin(f,p);require(!frames[i].dirty,"append requires flushed page");
+  require(offset<=PAGE&&length<=PAGE-offset,"append extent exceeds page");
+  auto found=lookup.find(f+":"+std::to_string(p));
+  const auto i=found==lookup.end()?frames.size():found->second;
+  if(i<frames.size())require(!frames[i].dirty,"append requires flushed page");
   int fd=descriptor(f);
   // An extent can be unaligned; explicit O_DIRECT remains supported by switching
   // this descriptor to buffered writes before publishing the appended payload.
@@ -310,8 +316,14 @@ void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offs
   if(static_cast<uint64_t>(size)<(p+1)*PAGE)require(::ftruncate(fd,static_cast<off_t>((p+1)*PAGE))==0,"append page extension failed");
   size_t remaining=length;const std::byte* source=static_cast<const std::byte*>(bytes);uint64_t position=p*PAGE+offset;
   while(remaining){auto done=retry_eintr([&]{return ::pwrite(fd,source,remaining,static_cast<off_t>(position));});require(done>0,"append write failed");source+=done;remaining-=done;position+=done;}
-  data_page_write_bytes+=length;std::memcpy(pages[i].get()+offset,bytes,length);
-  frames[i].dirty=frames[i].uncommitted=false;
+  data_page_write_bytes+=length;
+  // A cold append needs only its file extent. Preserve a resident clean copy
+  // when present, without populating a second cache for every appended page.
+  if(i<frames.size()){
+    std::memcpy(pages[i].get()+offset,bytes,length);
+    // A fresh index region can be flushed but still owned by this transaction.
+    // Preserve that ownership so clean-page release cannot bypass its lifetime.
+  }
   // Completed invisible append pages are reconstructible from the coherent
   // file. Keep partial tails hot and retain the kernel cache for future reads.
   const char* release=std::getenv("MVDB_APPEND_RELEASE");

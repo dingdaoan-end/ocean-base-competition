@@ -152,13 +152,28 @@ void Engine::write_row(const std::string& t,SlotId slot,std::vector<Value> value
   storage.store(t+".header",0,h);
 }
 void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
-  auto h=header(s.table);require(!h.nlist,"vector index already exists");auto col=column(cols,s.value);require(cols[col].type==Type::Vector,"index requires VECTOR column");
+  auto h=header(s.table);require(!h.nlist&&h.calibration_skipped!=2,"vector index already exists");auto col=column(cols,s.value);require(cols[col].type==Type::Vector,"index requires VECTOR column");
   uint32_t count=0;for(SlotId slot=0;slot<h.slots;++slot)if(meta(s.table,slot).active)++count;
   h.nlist=std::min<uint32_t>(count>=4096?64:8,count);h.ivector=static_cast<uint32_t>(col);require(h.nlist>0,"cannot train IVF on empty table");
+  const auto dim=cols[col].width;
+  const size_t full_workspace=h.nlist*dim*(sizeof(double)+sizeof(float))+1024;
+  const size_t narrow_workspace=h.nlist*dim*sizeof(float)*2+dim*sizeof(double)+1024;
+  if(std::min(full_workspace,narrow_workspace)>storage.budget.limit-storage.budget.used){
+    // Value 2 is a persistent Exact-only index. No training or unpublished
+    // region is allocated; ordinary transactional header Undo/WAL publishes it.
+    h.nlist=0;h.active_count=count;h.calibration_skipped=2;
+    h.calibration_queries=h.recommended_nprobe=h.calibration_stale=0;
+    h.mutations_since_calibration=0;h.rows_at_calibration=count;
+    storage.store(s.table+".header",0,h);return;
+  }
   prepare_vector_residency(s.table,h,cols);
+  // A prepared lease also charges its guard array. Let training reclaim that
+  // optional workspace rather than fail after the admission check above.
+  if(std::min(full_workspace,narrow_workspace)>storage.budget.limit-storage.budget.used){
+    prepared_vectors.reset();prepared_table.clear();
+  }
   auto region=storage.begin_region(s.table+".index.p");require(region.size()<sizeof(h.index_region),"index namespace too long");
   std::memcpy(h.index_region,region.c_str(),region.size()+1);h.active_count=count;
-  auto dim=cols[col].width;
   {
   constexpr size_t reseed_bytes=sizeof(std::pair<double,SlotId>)*64+sizeof(uint32_t)*64;
   size_t full=h.nlist*dim*(sizeof(double)+sizeof(float))+1024;
@@ -397,9 +412,9 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   }
   const size_t matching_bound=slice_last-slice_first;
   auto dim=cols[selected[distance]].width;const size_t vector_stride=stride(cols[selected[distance]]),count=PAGE/vector_stride;auto& query=queries[distance];bool safe=!has_extreme(query.data(),dim);
-  bool ivf=ann&&h.nlist&&selected[distance]==h.ivector;route="exact";last_probes=0;
+  bool ivf=ann&&h.nlist&&selected[distance]==h.ivector;route=ann&&h.calibration_skipped==2?"exact_fallback":"exact";last_probes=0;
   if(ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){ivf=false;route="exact_fallback";}
-  if(ivf&&!filters.empty()&&matching_bound<=32){ivf=false;route="exact_fallback";}
+  if(ivf&&!filters.empty()&&(matching_bound<=32||(slice!=&c->active_slots&&matching_bound<=2048))){ivf=false;route="exact_fallback";}
   size_t workspace=size_t(s.limit)*(sizeof(Value)*2+sizeof(std::vector<Value>)+64)+4096;
   if(!reuse)workspace+=size_t(h.slots)*4+c->vector_pages.size()*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+size_t(s.limit)*sizeof(TableReadCache::Neighbor);
   if(workspace>storage.budget.limit-storage.budget.used){read_cache.reset();return false;}
@@ -930,7 +945,7 @@ Result Engine::execute_inner(const Statement& s){
   else sorter=std::make_unique<Sorter>(storage,less);
   std::vector<uint32_t> buckets;size_t distance_expr=0;bool found=false;for(size_t i=0;i<expressions.size();++i)if(expressions[i].distance&&selected[i]==h.ivector){distance_expr=i;found=true;break;}
   bool use_ivf=ann&&h.nlist&&found&&!order.empty()&&order[0].first==distance_expr&&!order[0].second&&s.limit!=UINT64_MAX;
-  last_probes=0;route="exact";
+  last_probes=0;route=ann&&h.calibration_skipped==2?"exact_fallback":"exact";
   if(use_ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){use_ivf=false;route="exact_fallback";}
   std::vector<std::pair<double,uint32_t>> distances;
   if(use_ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);for(uint32_t b=0;b<h.nlist;++b){auto p=center_view(index_base(s.table,h),b,queries[distance_expr].size());distances.emplace_back(l2(queries[distance_expr].data(),p,queries[distance_expr].size()),b);}std::sort(distances.begin(),distances.end());for(size_t i=0;i<distances.size();++i)buckets.push_back(distances[i].second);}
