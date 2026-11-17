@@ -402,7 +402,14 @@ std::shared_ptr<FILE> Storage::temporary(){
   ::setvbuf(file,nullptr,_IONBF,0);
   return {file,[](FILE* p){::posix_fadvise(::fileno(p),0,0,POSIX_FADV_DONTNEED);std::fclose(p);}};
 }
-void Storage::sync_wal(){sync_file(wal);++wal_syncs;::posix_fadvise(wal,0,0,POSIX_FADV_DONTNEED);}
+void Storage::sync_wal(){
+  sync_file(wal);++wal_syncs;
+  // The next small append needs the incomplete kernel page's existing bytes.
+  // Advise only complete pages; length zero would instead mean through EOF.
+  const auto end=::lseek(wal,0,SEEK_END),page=::sysconf(_SC_PAGESIZE);
+  if(end>0&&page>0){const auto complete=end-end%page;
+    if(complete>0)::posix_fadvise(wal,0,complete,POSIX_FADV_DONTNEED);}
+}
 void Storage::record(char type,const std::string& payload) {
   if(type=='P'&&redo_capacity){
     std::string entry;append_value(entry,static_cast<uint32_t>(payload.size()));entry+=payload;

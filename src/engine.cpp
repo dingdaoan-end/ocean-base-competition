@@ -415,6 +415,7 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   bool ivf=ann&&h.nlist&&selected[distance]==h.ivector;route=ann&&h.calibration_skipped==2?"exact_fallback":"exact";last_probes=0;
   if(ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){ivf=false;route="exact_fallback";}
   if(ivf&&!filters.empty()&&(matching_bound<=32||(slice!=&c->active_slots&&matching_bound<=2048))){ivf=false;route="exact_fallback";}
+  if(ivf&&!nprobe&&filters.size()>1){ivf=false;route="exact_fallback";}
   size_t workspace=size_t(s.limit)*(sizeof(Value)*2+sizeof(std::vector<Value>)+64)+4096;
   if(!reuse)workspace+=size_t(h.slots)*4+c->vector_pages.size()*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+size_t(s.limit)*sizeof(TableReadCache::Neighbor);
   if(workspace>storage.budget.limit-storage.budget.used){read_cache.reset();return false;}
@@ -543,11 +544,12 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan_range(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
   else if(ivf)scan_range(candidates.begin(),candidates.end());
   else scan_range(slice->begin()+slice_first,slice->begin()+slice_last);
-  // Filter selectivity is not a recall certificate. Expand only a starved
-  // filtered query, in center order, until K verified rows have been seen.
+  // LIMIT matching rows do not establish filtered recall. Automatic probing
+  // keeps a safety window; explicit NPROBE retains its existing expansion rule.
   const char* expand_mode=std::getenv("MVDB_FILTER_EXPAND");
-  if(ivf&&!filters.empty()&&(!expand_mode||std::string_view(expand_mode)!="off")&&heap.size()<s.limit){
-    const size_t quota=matching_bound<=256?std::min<size_t>(matching_bound,std::max<size_t>(s.limit,32)):s.limit;
+  if(ivf&&!filters.empty()&&(!expand_mode||std::string_view(expand_mode)!="off")&&(!nprobe||heap.size()<s.limit)){
+    const size_t quota=!nprobe?std::min<size_t>(matching_bound,std::max<size_t>(64,s.limit*8)):
+      (matching_bound<=256?std::min<size_t>(matching_bound,std::max<size_t>(s.limit,32)):s.limit);
     while(last_probes<h.nlist&&accepted_rows<quota){
       auto b=distances[last_probes++].second;auto first=c->postings.begin()+c->offsets[b],last=c->postings.begin()+c->offsets[b+1];
       // A cold added page may evict any cached address: validate the entire
@@ -930,6 +932,66 @@ Result Engine::execute_inner(const Statement& s){
   }
   if(fast_topk(s,h,cols,expressions,selected,queries,order,predicates,result))return result;
   read_cache.reset();prepared_vectors.reset();prepared_table.clear();
+  // A tiny pool may reject the row-shaped TopK heap even though ten numeric
+  // winners fit easily. Avoid sorting/spilling every matching row in that case.
+  const bool automatic_exact=!ann||!h.nlist||(!nprobe&&
+    (h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||
+     h.recommended_nprobe>h.nlist/2||!predicates.empty()));
+  if(storage.budget.limit<4*1024*1024&&automatic_exact&&expressions.size()==2&&
+     s.limit>0&&s.limit<=10&&!order.empty()&&order.size()<=2&&!order[0].second){
+    size_t distance=2;bool eligible=true;
+    for(size_t i=0;i<2;++i){if(expressions[i].distance){if(distance!=2)eligible=false;distance=i;}
+      else if(selected[i]!=keycol)eligible=false;}
+    eligible&=distance<2&&order[0].first==distance;
+    if(order.size()==2){auto [i,descending]=order[1];
+      eligible&=!descending&&(i==2+keycol||(i<2&&!expressions[i].distance&&selected[i]==keycol));}
+    constexpr size_t tile_size=64;
+    const size_t workspace=sizeof(Meta)*tile_size+sizeof(Result::NumericRow)*10+
+      sizeof(uint64_t)*64+sizeof(uint64_t);
+    if(eligible&&workspace<=storage.budget.limit-storage.budget.used){
+      Reservation reserve(storage.budget,workspace);
+      std::array<Meta,tile_size> metadata{};std::array<Result::NumericRow,10> heap{};
+      std::array<uint64_t,64> visible{};size_t size=0;
+      auto less=[](const auto& a,const auto& b){return a.distance!=b.distance?a.distance<b.distance:a.key<b.key;};
+      const auto col=selected[distance],per_page=PAGE/stride(cols[col]);
+      const auto vectors=s.table+".v"+std::to_string(col),rows=s.table+".rows";
+      const auto& query=queries[distance];
+      for(uint64_t start=0;start<h.slots;start+=4096){
+        ++bitmap_blocks;auto bits=storage.pool.view(s.table+".valid",start/(PAGE*8));
+        std::memcpy(visible.data(),bits+(start%(PAGE*8))/8,sizeof(visible));
+        signature_filter(start,visible);
+        const auto end=std::min<uint64_t>(4096,h.slots-start);
+        for(size_t offset=0;offset<end;offset+=tile_size){
+          uint64_t keep=visible[offset/64];
+          if(!keep)continue;
+          const auto first=start+offset,count=std::min<uint64_t>(tile_size,end-offset);
+          auto page=storage.pool.view(rows,first/(PAGE/sizeof(Meta)));
+          std::memcpy(metadata.data(),page+(first%(PAGE/sizeof(Meta)))*sizeof(Meta),count*sizeof(Meta));
+          // Copy the metadata before reading blobs; no borrowed row-page pointer
+          // survives a pool call. Finish scalar filtering before pinning vectors.
+          for(size_t i=0;i<count;++i)if(keep&(uint64_t(1)<<i)){
+            ++candidate_slots;auto& m=metadata[i];
+            if(!m.active||(!predicates.empty()&&!matches(row(s.table,static_cast<SlotId>(first+i),m,cols,false))))
+              keep&=~(uint64_t(1)<<i);
+          }
+          BufferPool::PageGuard vector_page;uint64_t current=UINT64_MAX;
+          for(size_t i=0;i<count;++i)if(keep&(uint64_t(1)<<i)){
+            const auto slot=first+i,p=slot/per_page;
+            if(p!=current){vector_page.reset();vector_page=storage.pool.lease(vectors,p);current=p;}
+            auto values=reinterpret_cast<const float*>(vector_page.data+(slot%per_page)*stride(cols[col]));
+            Result::NumericRow next{metadata[i].key,l2_exact(values,query.data(),cols[col].width)};
+            if(size<s.limit){heap[size++]=next;std::push_heap(heap.begin(),heap.begin()+size,less);}
+            else if(less(next,heap[0])){std::pop_heap(heap.begin(),heap.begin()+size,less);heap[size-1]=next;std::push_heap(heap.begin(),heap.begin()+size,less);}
+          }
+        }
+      }
+      std::sort(heap.begin(),heap.begin()+size,less);
+      std::copy_n(heap.begin(),size,result.numeric_rows.begin());
+      result.numeric_count=size;result.numeric_distance_column=distance;last_probes=0;
+      route=ann&&(h.nlist||h.calibration_skipped==2)?"exact_fallback":"exact";
+      return result;
+    }
+  }
   const size_t projected=expressions.size(),pkpos=projected+cols.size();
   auto less=[&](const std::vector<Value>& a,const std::vector<Value>& b){for(auto [i,desc]:order){int n=compare(a[i],b[i]);if(n)return desc?n>0:n<0;}return compare(a[pkpos],b[pkpos])<0;};
   bool need_values=false;
@@ -947,6 +1009,9 @@ Result Engine::execute_inner(const Statement& s){
   bool use_ivf=ann&&h.nlist&&found&&!order.empty()&&order[0].first==distance_expr&&!order[0].second&&s.limit!=UINT64_MAX;
   last_probes=0;route=ann&&h.calibration_skipped==2?"exact_fallback":"exact";
   if(use_ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){use_ivf=false;route="exact_fallback";}
+  // Unencoded filters have no calibrated recall certificate. A LIMIT-sized
+  // candidate set can still miss nearer matching rows in unprobed buckets.
+  if(use_ivf&&!nprobe&&!predicates.empty()){use_ivf=false;route="exact_fallback";}
   std::vector<std::pair<double,uint32_t>> distances;
   if(use_ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);for(uint32_t b=0;b<h.nlist;++b){auto p=center_view(index_base(s.table,h),b,queries[distance_expr].size());distances.emplace_back(l2(queries[distance_expr].data(),p,queries[distance_expr].size()),b);}std::sort(distances.begin(),distances.end());for(size_t i=0;i<distances.size();++i)buckets.push_back(distances[i].second);}
   if(s.limit==0)return result;
