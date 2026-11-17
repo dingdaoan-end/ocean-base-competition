@@ -133,7 +133,7 @@ class Engine {
   std::vector<Value> row(const std::string&,SlotId,const Meta&,const std::vector<Column>&,bool);
   const float* vector_view(const std::string&,SlotId,size_t,const Column&);
   const float* center_view(const std::string&,uint32_t,size_t);
-  void write_row(const std::string&,SlotId,std::vector<Value>,const std::vector<Column>&,bool);
+  void write_row(const std::string&,SlotId,std::vector<Value>,const std::vector<Column>&,bool,std::string* scratch=nullptr);
   std::string read_blob(const std::string&,uint64_t,uint32_t);
   void write_blob(const std::string&,uint64_t,const std::string&,bool append=false);
   void bitmap(const std::string&,SlotId,bool);
