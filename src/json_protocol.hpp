@@ -25,6 +25,16 @@ class Parser {
     if(!eat('"'))fail();
     std::string out;
     while(pos<source.size()){
+      // Validate an ordinary ASCII span before copying it in one append.
+      // Escapes and multibyte UTF-8 retain the strict decoder below.
+      size_t run=pos;
+      while(pos<source.size()){
+        unsigned char byte=source[pos];
+        if(byte<32||byte>=0x80||byte=='"'||byte=='\\')break;
+        ++pos;
+      }
+      if(pos!=run)out.append(source.data()+run,pos-run);
+      if(pos==source.size())fail();
       unsigned char c=source[pos++];if(c=='"')return out;if(c<32)fail();
       if(c=='\\'){
         if(pos==source.size())fail();

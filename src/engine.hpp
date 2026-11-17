@@ -61,6 +61,7 @@ class Engine {
   // Cumulative executor work: PK probes, 4096-slot validity blocks,
   // and visible candidates surviving scalar signatures (before exact predicates).
   uint64_t point_lookups=0,bitmap_blocks=0,candidate_slots=0;
+  uint64_t metadata_reads=0,projection_scanned=0,projection_direct=0;
   struct Header {
     uint32_t magic=0,slots=0;
     uint64_t blob_end=0;
@@ -80,6 +81,7 @@ class Engine {
   struct TableReadCache {
     std::string table;
     uint32_t slots=0;
+    bool metadata_only=false;
     std::shared_ptr<void> reservation;
     std::vector<int64_t> keys;
     std::vector<uint8_t> flags; // active and extreme
@@ -120,7 +122,7 @@ class Engine {
   void prepare_vector_residency(const std::string&,const Header&,const std::vector<Column>&);
   uint64_t cache_builds=0;
   uint64_t bounded_attempts=0,bounded_pruned=0,bounded_fallbacks=0;
-  TableReadCache* cache(const std::string&,const Header&,const std::vector<Column>&);
+  TableReadCache* cache(const std::string&,const Header&,const std::vector<Column>&,bool metadata_only=false);
   bool fast_topk(const Statement&,const Header&,const std::vector<Column>&,
                  const std::vector<Expr>&,const std::vector<size_t>&,
                  const std::vector<std::vector<float>>&,
@@ -175,6 +177,9 @@ public:
   uint64_t point_lookup_count() const{return point_lookups;}
   uint64_t candidate_bitmap_blocks() const{return bitmap_blocks;}
   uint64_t candidate_slots_examined() const{return candidate_slots;}
+  uint64_t metadata_rows_read() const{return metadata_reads;}
+  uint64_t projection_scan_slots() const{return projection_scanned;}
+  uint64_t projection_slice_queries() const{return projection_direct;}
   uint64_t page_access_count() const{return storage.pool.page_accesses;}
   uint64_t buffer_page_load_count() const{return storage.pool.physical_reads;}
   uint64_t buffer_eviction_count() const{return storage.pool.frame_evictions;}
