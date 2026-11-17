@@ -14,6 +14,10 @@ namespace {
 uint64_t total_spill_bytes=0;
 void require(bool yes,std::string_view s){if(!yes)throw std::runtime_error(std::string(s));}
 struct Reservation {MemoryBudget& b;size_t n;std::weak_ptr<char> lifetime;Reservation(MemoryBudget& budget,size_t bytes):b(budget),n(bytes),lifetime(budget.lifetime){b.acquire(n);}~Reservation(){if(!lifetime.expired())b.release(n);}};
+template<class T>T scalar_field(std::string_view bytes,size_t& at){
+  require(at<=bytes.size()&&sizeof(T)<=bytes.size()-at,"corrupt scalar row");
+  T value;std::memcpy(&value,bytes.data()+at,sizeof(value));at+=sizeof(value);return value;
+}
 size_t column(const std::vector<Column>& cols,const std::string& name){for(size_t i=0;i<cols.size();++i)if(cols[i].name==name)return i;throw std::runtime_error("unknown column: "+name);}
 size_t primary(const std::vector<Column>& cols){for(size_t i=0;i<cols.size();++i)if(cols[i].primary)return i;throw std::runtime_error("missing primary key");}
 size_t stride(const Column& c){return ((c.width+7)/8)*32;}
@@ -56,37 +60,52 @@ static_assert(sizeof(PackedDirectory)<PAGE);
 void spill_progress(FILE* f,off_t before){auto after=::ftello(f);if(before/SPILL_CACHE_CHUNK!=after/SPILL_CACHE_CHUNK)::posix_fadvise(::fileno(f),0,after/PAGE*PAGE,POSIX_FADV_DONTNEED);}
 // Sort/result files are disposable after process death. They need no durability
 // syncs; advise the kernel only after several MiB of sequential work.
-void spill_write(FILE* f,const std::vector<Value>& row){auto before=::ftello(f);auto s=pack_values(row);uint32_t n=static_cast<uint32_t>(s.size());require(std::fwrite(&n,4,1,f)==1&&std::fwrite(s.data(),1,s.size(),f)==s.size(),"result spill failed");total_spill_bytes+=4+s.size();spill_progress(f,before);}
-bool spill_read(FILE* f,std::vector<Value>& row){auto before=::ftello(f);uint32_t n=0;auto count=std::fread(&n,1,4,f);if(!count){require(!std::ferror(f),"result read failed");return false;}require(count==4&&n<=16*1024*1024,"corrupt spill record");std::string s(n,'\0');require(std::fread(s.data(),1,n,f)==n,"truncated spill record");row=unpack_values(s);spill_progress(f,before);return true;}
+// Decode into stable Value alternatives; subsequent rows reuse string/vector capacity.
+void decode_reuse(std::string_view bytes,std::vector<Value>& out){
+  size_t at=0;auto read=[&]<class T>(){require(sizeof(T)<=bytes.size()-at,"truncated value");T value;std::memcpy(&value,bytes.data()+at,sizeof(T));at+=sizeof(T);return value;};
+  auto n=read.template operator()<uint32_t>();require(n<=1024,"corrupt row count");out.resize(n);
+  for(auto& v:out){auto tag=read.template operator()<uint8_t>();
+    if(tag==0)v=read.template operator()<int64_t>();
+    else if(tag==1)v=read.template operator()<double>();
+    else if(tag==2){auto n=read.template operator()<uint32_t>();require(n<=bytes.size()-at,"corrupt string");if(!std::holds_alternative<std::string>(v))v.emplace<std::string>();std::get<std::string>(v).assign(bytes.data()+at,n);at+=n;}
+    else if(tag==3){auto n=read.template operator()<uint32_t>();require(n<=(bytes.size()-at)/4,"corrupt vector");if(!std::holds_alternative<std::vector<float>>(v))v.emplace<std::vector<float>>();auto& a=std::get<std::vector<float>>(v);a.resize(n);std::memcpy(a.data(),bytes.data()+at,size_t(n)*4);at+=size_t(n)*4;}
+    else require(false,"corrupt value tag");
+  }require(at==bytes.size(),"trailing stored bytes");
+}
+size_t encoded_bytes(const std::vector<Value>& row){size_t n=4;for(auto& v:row){n+=1;if(auto s=std::get_if<std::string>(&v))n+=4+s->size();else if(auto a=std::get_if<std::vector<float>>(&v))n+=4+a->size()*4;else n+=8;}return n;}
+void spill_write(FILE* f,const std::vector<Value>& row,std::string* reusable=nullptr){auto before=::ftello(f);std::string local;auto& s=reusable?*reusable:local;pack_values_into(row,s);uint32_t n=static_cast<uint32_t>(s.size());require(std::fwrite(&n,4,1,f)==1&&std::fwrite(s.data(),1,s.size(),f)==s.size(),"result spill failed");total_spill_bytes+=4+s.size();spill_progress(f,before);}
+bool spill_read(FILE* f,std::vector<Value>& row,std::string* reusable=nullptr){auto before=::ftello(f);uint32_t n=0;auto count=std::fread(&n,1,4,f);if(!count){require(!std::ferror(f),"result read failed");return false;}require(count==4&&n<=16*1024*1024,"corrupt spill record");std::string local;auto& s=reusable?*reusable:local;s.resize(n);require(std::fread(s.data(),1,n,f)==n,"truncated spill record");if(reusable)decode_reuse(s,row);else row=unpack_values(s);spill_progress(f,before);return true;}
 void discard_cache(FILE* f){auto pos=::ftello(f);if(pos>0)::posix_fadvise(::fileno(f),0,pos/PAGE*PAGE,POSIX_FADV_DONTNEED);}
 class Sorter {
   Storage& storage;
   Reservation memory;
   size_t used=0,capacity;
+  std::string serialized;
+  bool reuse_buffers;
   std::vector<std::vector<Value>> chunk;
   std::vector<std::shared_ptr<FILE>> levels;
   std::function<bool(const std::vector<Value>&,const std::vector<Value>&)> less;
   std::shared_ptr<FILE> merge(std::shared_ptr<FILE> a,std::shared_ptr<FILE> b){
-    std::rewind(a.get());std::rewind(b.get());auto out=storage.temporary();std::vector<Value> x,y;
-    bool ax=spill_read(a.get(),x),by=spill_read(b.get(),y);
-    while(ax||by){if(ax&&(!by||!less(y,x))){spill_write(out.get(),x);ax=spill_read(a.get(),x);}
-      else{spill_write(out.get(),y);by=spill_read(b.get(),y);}}
+    std::rewind(a.get());std::rewind(b.get());auto out=storage.temporary();std::vector<Value> x,y;std::string xb,yb,ob;
+    bool ax=spill_read(a.get(),x,reuse_buffers?&xb:nullptr),by=spill_read(b.get(),y,reuse_buffers?&yb:nullptr);
+    while(ax||by){if(ax&&(!by||!less(y,x))){spill_write(out.get(),x,reuse_buffers?&ob:nullptr);ax=spill_read(a.get(),x,reuse_buffers?&xb:nullptr);}
+      else{spill_write(out.get(),y,reuse_buffers?&ob:nullptr);by=spill_read(b.get(),y,reuse_buffers?&yb:nullptr);}}
     discard_cache(a.get());discard_cache(b.get());discard_cache(out.get());return out;
   }
-  void run(){if(chunk.empty())return;std::sort(chunk.begin(),chunk.end(),less);auto f=storage.temporary();for(auto& r:chunk)spill_write(f.get(),r);chunk.clear();used=0;
+  void run(){if(chunk.empty())return;std::sort(chunk.begin(),chunk.end(),less);auto f=storage.temporary();for(auto& r:chunk)spill_write(f.get(),r,reuse_buffers?&serialized:nullptr);chunk.clear();used=0;
     discard_cache(f.get());size_t i=0;
     while(i<levels.size()&&levels[i]){f=merge(levels[i],f);levels[i].reset();++i;}
     if(i==levels.size())levels.emplace_back();
     levels[i]=f;
   }
 public:
-  Sorter(Storage& s,decltype(less) fn):storage(s),memory(s.budget,(s.budget.limit-s.budget.used)/2),capacity(memory.n/2),less(std::move(fn)){}
-  void add(std::vector<Value> values){size_t n=pack_values(values).size()*3+values.size()*sizeof(Value)+128;
+  Sorter(Storage& s,decltype(less) fn,bool reuse=false):storage(s),memory(s.budget,(s.budget.limit-s.budget.used)/2),capacity(memory.n/2),reuse_buffers(reuse),less(std::move(fn)){}
+  void add(std::vector<Value> values){size_t n=encoded_bytes(values)*(reuse_buffers?6:3)+values.size()*sizeof(Value)+128;
     require(n<=capacity,"query row exceeds workspace budget");if(used+n>capacity)run();used+=n;chunk.push_back(std::move(values));}
   std::shared_ptr<FILE> finish(){run();std::shared_ptr<FILE> out;for(auto& f:levels)if(f)out=out?merge(out,f):f;if(!out)out=storage.temporary();std::rewind(out.get());return out;}
 };
 }
-void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(numeric_count){std::vector<Value> row(2);for(size_t i=0;i<numeric_count;++i){row[numeric_distance_column]=numeric_rows[i].distance;row[1-numeric_distance_column]=numeric_rows[i].key;callback(row);}return;}if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;while(spill_read(rows.get(),r))callback(r);discard_cache(rows.get());}
+void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(numeric_count){std::vector<Value> row(2);for(size_t i=0;i<numeric_count;++i){row[numeric_distance_column]=numeric_rows[i].distance;row[1-numeric_distance_column]=numeric_rows[i].key;callback(row);}return;}if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;std::string bytes;while(spill_read(rows.get(),r,memory_reservation?&bytes:nullptr))callback(r);discard_cache(rows.get());}
 uint64_t Engine::spill_bytes() const{return total_spill_bytes;}
 Engine::Header Engine::header(const std::string& t){auto h=storage.load<Header>(t+".header",0);if(h.magic!=0x4d564442)throw std::runtime_error("table does not exist: "+t);return h;}
 std::vector<Column> Engine::schema(const Header& h){require(h.schema_size<sizeof(h.schema),"corrupt schema");return parse(std::string_view(h.schema,h.schema_size)).columns;}
@@ -435,6 +454,7 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   if(!reuse)workspace+=size_t(h.slots)*4+c->vector_pages.size()*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+size_t(s.limit)*sizeof(TableReadCache::Neighbor);
   if(workspace>storage.budget.limit-storage.budget.used){read_cache.reset();return false;}
   std::optional<Reservation> reservation;reservation.emplace(storage.budget,workspace);
+  storage.pool.grow_read_cache(c->vector_pages.size(),32);
   // Validate without loading: loading one missing page could evict any earlier
   // borrowed address. The all-resident scan below makes no pool calls at all.
   std::vector<const std::byte*> local_bases;
@@ -470,6 +490,9 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   bool separated=ivf&&filters.empty()&&!distances.empty()&&distances.back().first>4*distances.front().first;
   bool progressive=dim==128&&all_resident&&safe&&policy!="off"&&(!ivf||separated);
   bool retry=(policy=="auto"||policy=="retry")&&progressive;double failed_threshold=0,bounded_cutoff=INFINITY;
+  // Recheck data distribution, not only heap tightening. Keep ANN/filter routes
+  // on their existing policy until they have independent cost evidence.
+  bool sentinel_retry=policy=="auto"&&retry&&!ivf&&filters.empty()&&!key_filter;
   auto consume=[&]<bool Resident128,bool Bounded,bool CountAccepted>(SlotId slot,double computed=-1) __attribute__((always_inline)) {bool yes=true;for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id){yes=false;break;}if(!yes)return;
     if(impossible_key||(key_filter&&c->keys[slot]!=*key_filter))return;
     if constexpr(CountAccepted)++accepted_rows;
@@ -526,7 +549,13 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     auto it=first;
     while(it!=last){
       if(!progressive){
-        auto end=it+std::min<decltype(last-it)>(256,last-it);loop.template operator()<false>(it,end);it=end;
+        auto end=it+std::min<decltype(last-it)>(256,last-it);
+        if(sentinel_retry&&heap.size()==s.limit&&last-it>=256){
+          prefix_trials=prefix_prunes=0;bounded_cutoff=l2_bounded_cutoff(heap.front().squared);
+          consume.template operator()<Resident128,true,CountAccepted>(*it++);
+          if(prefix_prunes){progressive=true;continue;}
+        }
+        loop.template operator()<false>(it,end);it=end;
         if(failed_threshold>0&&heap.size()==s.limit&&heap.front().squared<=failed_threshold*.25){progressive=true;prefix_trials=prefix_prunes=0;bounded_cutoff=l2_bounded_cutoff(heap.front().squared);}
         continue;
       }
@@ -542,6 +571,10 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
       if(all_resident&&dim==128){
         if(ivf)scan.template operator()<true,true,CountAccepted,false>(first,last);
         else if(filters.empty()&&!key_filter){
+          // Once the initial window fails, let full-distance work batch at once.
+          // A sparse actual-candidate sentinel can reopen the same 64-row test
+          // after a distribution change, even if the heap threshold is stable.
+          if(policy=="auto"){scan.template operator()<true,false,CountAccepted,true>(first,last);return;}
           // A failed initial 64-row window does not distinguish a uniform
           // workload from a clustered heap that has not tightened yet. Keep
           // the scalar/pruning loop for a bounded warm prefix before choosing
@@ -628,12 +661,12 @@ Result Engine::execute(std::string_view sql){
   try {
   last_probes=last_lists=last_recommended=0;route="none";
   if(is_insert(sql)){
-    select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();Reservation input(storage.budget,sql.size()+512);
+    select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();storage.pool.shrink_read_cache();Reservation input(storage.budget,sql.size()+512);
     bool automatic=!storage.in_transaction();if(automatic)storage.begin();auto point=storage.savepoint();
     try{auto result=insert_stream(sql);if(automatic)storage.commit();return result;}
     catch(...){storage.rollback_to(point);if(automatic)storage.rollback();throw;}
   }
-  if(sql.size()*4+512>storage.budget.limit-storage.budget.used){select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();}
+  if(sql.size()*4+512>storage.budget.limit-storage.budget.used){select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();storage.pool.shrink_read_cache();}
   Reservation input(storage.budget,sql.size()*4+512);
   if(select_workspace&&sql.size()<=16384&&reuse_select(select_workspace->pattern,sql,select_workspace->statement)){
     ++reused_select_queries;
@@ -645,7 +678,7 @@ Result Engine::execute(std::string_view sql){
   // Full projections/sorts cannot use the bounded resident TopK path. Do not
   // let its preparation lease reserve frames across an unrelated scan.
   if(s.kind==Statement::Select&&(s.limit>4096||s.expressions.size()!=2||s.order.empty())){read_cache.reset();prepared_vectors.reset();prepared_table.clear();}
-  if(s.kind!=Statement::Select&&s.kind!=Statement::Set){read_cache.reset();prepared_vectors.reset();prepared_table.clear();}
+  if((s.kind!=Statement::Select&&s.kind!=Statement::Set)||(s.kind==Statement::Select&&storage.pool.has_read_cache_growth())){read_cache.reset();prepared_vectors.reset();prepared_table.clear();storage.pool.shrink_read_cache();}
   if(s.kind==Statement::Begin){storage.begin();return {};}
   if(s.kind==Statement::Commit){storage.commit();return {};}
   if(s.kind==Statement::Rollback){storage.rollback();return {};}
@@ -654,7 +687,7 @@ Result Engine::execute(std::string_view sql){
   preparation_cache_allowed=automatic&&s.kind==Statement::CreateIndex;
   try{auto result=execute_inner(s);if(automatic)storage.commit();preparation_cache_allowed=false;return result;}
   catch(...){preparation_cache_allowed=false;if(writes){storage.rollback_to(point);if(automatic)storage.rollback();}throw;}
-  }catch(...){select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();throw;}
+  }catch(...){select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();storage.pool.shrink_read_cache();throw;}
 }
 Result Engine::insert_stream(std::string_view sql){
   // Hole reuse takes ordinary transactional page writes, preserving undo even
@@ -882,6 +915,48 @@ Result Engine::execute_inner(const Statement& s){
   if(s.kind==Statement::CreateIndex){create_index(s,cols);return result;}
   std::vector<std::pair<size_t,Value>> predicates;for(auto& c:s.conditions){auto i=column(cols,c.column);auto type=cols[i];if(type.type==Type::Varchar)type.width=UINT32_MAX;predicates.emplace_back(i,convert({c.literal,c.quoted},type));}
   auto matches=[&](const std::vector<Value>& values){for(size_t j=0;j<predicates.size();++j){auto& [i,v]=predicates[j];auto n=compare(values[i],v);auto op=s.conditions[j].op;bool yes=(op=="="?n==0:op=="!="||op=="<>"?n!=0:op=="<"?n<0:op==">"?n>0:op=="<="?n<=0:n>=0);if(!yes)return false;}return true;};
+  auto comparison=[](int n,const std::string& op){return op=="="?n==0:op=="!="||op=="<>"?n!=0:op=="<"?n<0:op==">"?n>0:op=="<="?n<=0:n>=0;};
+  bool scalar_predicates=true,nonkey_predicates=false;
+  for(auto& [i,value]:predicates){scalar_predicates&=cols[i].type!=Type::Vector;nonkey_predicates|=i!=keycol;}
+  std::string predicate_blob;std::optional<Reservation> predicate_memory;
+  const auto predicate_file=s.table+".blob";
+  // A hash only rejects. Exact scalar comparisons borrow views from one charged
+  // row buffer; primary-key predicates require only the copied Meta.
+  auto matches_slot=[&](SlotId slot,const Meta& m){
+    if(!m.active)return false;
+    if(!scalar_predicates)return matches(row(s.table,slot,m,cols,false));
+    for(size_t j=0;j<predicates.size();++j)if(predicates[j].first==keycol){
+      auto value=std::get<int64_t>(predicates[j].second);int n=(m.key>value)-(m.key<value);
+      if(!comparison(n,s.conditions[j].op))return false;
+    }
+    if(!nonkey_predicates)return true;
+    if(m.length>predicate_blob.capacity()){
+      std::string().swap(predicate_blob);predicate_memory.reset();
+      predicate_memory.emplace(storage.budget,std::max<size_t>(32,size_t(m.length)*2+1));
+      predicate_blob.reserve(m.length);
+      if(predicate_blob.capacity()+1>predicate_memory->n){auto extra=predicate_blob.capacity()+1-predicate_memory->n;storage.budget.acquire(extra);predicate_memory->n+=extra;}
+    }
+    predicate_blob.clear();auto offset=m.offset;size_t remaining=m.length;
+    while(remaining){auto page=storage.pool.view(predicate_file,offset/PAGE);auto n=std::min<uint64_t>(remaining,PAGE-offset%PAGE);
+      predicate_blob.append(reinterpret_cast<const char*>(page+offset%PAGE),n);offset+=n;remaining-=n;}
+    std::string_view bytes(predicate_blob);size_t at=0;auto count=scalar_field<uint32_t>(bytes,at);
+    require(count==cols.size(),"corrupt row width");bool yes=true;
+    for(size_t c=0;c<count;++c){auto tag=scalar_field<uint8_t>(bytes,at);int64_t integer=0;double number=0;std::string_view text;
+      if(tag==0)integer=scalar_field<int64_t>(bytes,at);
+      else if(tag==1)number=scalar_field<double>(bytes,at);
+      else if(tag==2||tag==3){uint64_t n=scalar_field<uint32_t>(bytes,at);if(tag==3)n*=sizeof(float);
+        require(n<=bytes.size()-at,"corrupt scalar payload");text=bytes.substr(at,n);at+=n;}
+      else require(false,"corrupt value tag");
+      for(size_t j=0;j<predicates.size();++j)if(predicates[j].first==c&&c!=keycol){auto& value=predicates[j].second;
+        require(value.index()==tag,"incompatible comparison types");int n=0;
+        if(tag==0){auto other=std::get<int64_t>(value);n=(integer>other)-(integer<other);}
+        else if(tag==1){auto other=std::get<double>(value);n=(number>other)-(number<other);}
+        else {require(tag==2,"VECTOR comparison is unsupported");n=text.compare(std::get<std::string>(value));}
+        yes&=comparison(n,s.conditions[j].op);
+      }
+    }
+    require(at==bytes.size(),"trailing stored bytes");return yes;
+  };
   // Only converted primary-key equalities establish a singleton candidate set.
   // Keep all predicates for exact verification, including contradictory ANDs.
   std::optional<int64_t> point_key;bool conflicting_key=false;
@@ -946,11 +1021,29 @@ Result Engine::execute_inner(const Statement& s){
       }
       write_row(s.table,slot,std::move(values),cols,s.kind==Statement::Update,scratch);
     };
-    if(point_key){
-      if(auto slot=point_slot()){
-        auto m=meta(s.table,*slot);auto values=row(s.table,*slot,m,cols,s.kind==Statement::Update);
-        if(matches(values)){for(auto& [i,v]:changes)values[i]=v;
-          write_updated(*slot,std::move(values));++result.affected_rows;}
+    auto apply_slot=[&](SlotId slot,const Meta& m){
+      if(!matches_slot(slot,m))return;
+      auto values=s.kind==Statement::Update?row(s.table,slot,m,cols,true):std::vector<Value>(cols.size());
+      values[keycol]=m.key;for(auto& [i,v]:changes)values[i]=v;
+      write_updated(slot,std::move(values));++result.affected_rows;
+    };
+    if(point_key){if(auto slot=point_slot())apply_slot(*slot,meta(s.table,*slot));return result;}
+    int64_t low=INT64_MIN,high=INT64_MAX;bool bounded=false,empty=false,key_changes=false;
+    for(auto& [i,v]:changes)key_changes|=i==keycol;
+    for(size_t j=0;j<predicates.size();++j)if(predicates[j].first==keycol){auto value=std::get<int64_t>(predicates[j].second);auto& op=s.conditions[j].op;
+      if(op==">="||op==">"){bounded=true;if(op==">"){if(value==INT64_MAX){empty=true;continue;}++value;}low=std::max(low,value);}
+      if(op=="<="||op=="<"){bounded=true;if(op=="<"){if(value==INT64_MIN){empty=true;continue;}--value;}high=std::min(high,value);}
+    }
+    if(empty||low>high)return result;
+    // A PK-changing range uses the physical scan: a moved key must not be
+    // visited twice by a live lower_bound cursor (the Halloween problem).
+    if(bounded&&!key_changes){
+      PrimaryIndex index(storage,s.table+".pk");Reservation cursor_memory(storage.budget,512);
+      for(auto next=index.lower_bound(low);next&&next->first<=high;){
+        auto [key,slot]=*next;++point_lookups;
+        if(slot<h.slots){++candidate_slots;auto m=meta(s.table,slot);if(m.active&&m.key==key)apply_slot(slot,m);}
+        if(key==INT64_MAX)break;
+        next=index.lower_bound(key+1);
       }
       return result;
     }
@@ -960,9 +1053,7 @@ Result Engine::execute_inner(const Statement& s){
       signature_filter(start,candidates);auto end=std::min<uint64_t>(4096,h.slots-start);
       each_set_bit(candidates,0,end,[&](size_t at){
         ++candidate_slots;auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);if(!m.active)return;
-        auto values=row(s.table,slot,m,cols,s.kind==Statement::Update);if(!matches(values))return;
-        for(auto& [i,v]:changes)values[i]=v;
-        write_updated(slot,std::move(values));++result.affected_rows;
+        apply_slot(slot,m);
       });
     }return result;}
   require(s.kind==Statement::Select,"invalid execution kind");
@@ -1033,7 +1124,7 @@ Result Engine::execute_inner(const Statement& s){
           // survives a pool call. Finish scalar filtering before pinning vectors.
           for(size_t i=0;i<count;++i)if(keep&(uint64_t(1)<<i)){
             ++candidate_slots;auto& m=metadata[i];
-            if(!m.active||(!predicates.empty()&&!matches(row(s.table,static_cast<SlotId>(first+i),m,cols,false))))
+            if(!m.active||(!predicates.empty()&&!matches_slot(static_cast<SlotId>(first+i),m)))
               keep&=~(uint64_t(1)<<i);
           }
           BufferPool::PageGuard vector_page;uint64_t current=UINT64_MAX;
@@ -1072,7 +1163,7 @@ Result Engine::execute_inner(const Statement& s){
     // row(false) simultaneously owns the serialized blob and unpacked scalars.
     // Charge one reusable row of scratch, including unprojected VARCHARs and
     // transient Value-container growth; this is independent of winner count.
-    if(s.limit&&(!predicates.empty()||scalar_values)){
+    if(s.limit&&(nonkey_predicates||scalar_values)){
       retained+=256+sizeof(uint32_t)+cols.size()*(3*sizeof(Value)+sizeof(uint8_t)+sizeof(uint64_t));
       for(auto& c:cols)if(c.type==Type::Varchar)retained+=2*(size_t(c.width)*4+1);
     }
@@ -1087,7 +1178,7 @@ Result Engine::execute_inner(const Statement& s){
         signature_filter(start,visible);
         each_set_bit(visible,0,std::min<uint64_t>(4096,h.slots-start),[&](size_t at){
           ++candidate_slots;auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);
-          if(!m.active||(!predicates.empty()&&!matches(row(s.table,slot,m,cols,false))))return;
+          if(!m.active||(!predicates.empty()&&!matches_slot(slot,m)))return;
           Winner next{m.key,slot};
           if(winners.size()<s.limit){winners.push_back(next);std::push_heap(winners.begin(),winners.end(),less);}
           else if(less(next,winners.front())){std::pop_heap(winners.begin(),winners.end(),less);winners.back()=next;std::push_heap(winners.begin(),winners.end(),less);}
@@ -1107,6 +1198,91 @@ Result Engine::execute_inner(const Statement& s){
         result.memory_rows->push_back(std::move(output));
       }
       result.memory_reservation=std::move(reservation);last_probes=0;route=ann&&h.calibration_skipped==2?"exact_fallback":"exact";return result;
+    }
+  }
+  // Sort identities and ORDER values; projected payloads are copied only after ranking.
+  // A conservative one-row codec bound keeps the legacy path for tight budgets.
+  {
+    const size_t projected=expressions.size();bool order_scalars=false,output_scalars=false;
+    size_t scalar_bytes=0,output_bytes=0,key_bytes=0;
+    for(auto& c:cols)if(c.type==Type::Varchar)scalar_bytes+=size_t(c.width)*4;
+    for(size_t i=0;i<projected;++i)if(!expressions[i].distance){auto& c=cols[selected[i]];
+      output_scalars|=selected[i]!=keycol&&c.type!=Type::Vector;
+      if(c.type==Type::Vector||c.type==Type::Varchar)output_bytes+=size_t(c.width)*4;
+    }
+    for(auto [i,desc]:order){(void)desc;bool distance=i<projected&&expressions[i].distance;auto c=i<projected?selected[i]:i-projected;
+      if(!distance){require(cols[c].type!=Type::Vector,"VECTOR comparison is unsupported");order_scalars|=c!=keycol;if(cols[c].type==Type::Varchar)key_bytes+=size_t(cols[c].width)*4;}
+    }
+    size_t scratch=256+(cols.size()+projected+3*(order.size()+2))*3*sizeof(Value)+6*(scalar_bytes+output_bytes+key_bytes+(cols.size()+projected+order.size()+2)*9);
+    if(scratch<=(storage.budget.limit-storage.budget.used)/4){
+      auto workspace=std::make_shared<Reservation>(storage.budget,scratch);
+      std::string blob,packed;std::vector<Value> scalars,output(projected),keys(order.size()+2);
+      const auto blob_file=s.table+".blob";
+      auto scalar_row=[&](SlotId slot,const Meta& m){(void)slot;blob.resize(m.length);size_t done=0;while(done<m.length){auto offset=m.offset+done;auto page=storage.pool.view(blob_file,offset/PAGE);auto count=std::min<size_t>(m.length-done,PAGE-offset%PAGE);std::memcpy(blob.data()+done,page+offset%PAGE,count);done+=count;}decode_reuse(blob,scalars);require(scalars.size()==cols.size(),"corrupt row width");};
+      auto less=[&](const std::vector<Value>& a,const std::vector<Value>& b){for(size_t j=0;j<order.size();++j){int n=compare(a[j],b[j]);if(n)return order[j].second?n>0:n<0;}return std::get<int64_t>(a[order.size()])<std::get<int64_t>(b[order.size()]);};
+      size_t key_retained=(order.size()+2)*(sizeof(Value)+16)+256+3*key_bytes;
+      bool use_heap=s.limit<=4096&&s.limit<=((storage.budget.limit-storage.budget.used)*3/4)/key_retained;
+      std::shared_ptr<Reservation> heap_memory;std::vector<std::vector<Value>> heap;std::unique_ptr<Sorter> sorter;
+      if(use_heap){heap_memory=std::make_shared<Reservation>(storage.budget,key_retained*s.limit);heap.reserve(s.limit);}else sorter=std::make_unique<Sorter>(storage,less,true);
+  std::vector<uint32_t> buckets;size_t distance_expr=0;bool found=false;for(size_t i=0;i<expressions.size();++i)if(expressions[i].distance&&selected[i]==h.ivector){distance_expr=i;found=true;break;}
+  bool use_ivf=ann&&h.nlist&&found&&!order.empty()&&order[0].first==distance_expr&&!order[0].second&&s.limit!=UINT64_MAX;
+  last_probes=0;route=ann&&h.calibration_skipped==2?"exact_fallback":"exact";
+  if(use_ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){use_ivf=false;route="exact_fallback";}
+  // Unencoded filters have no calibrated recall certificate. A LIMIT-sized
+  // candidate set can still miss nearer matching rows in unprobed buckets.
+  if(use_ivf&&!nprobe&&!predicates.empty()){use_ivf=false;route="exact_fallback";}
+  std::vector<std::pair<double,uint32_t>> distances;
+  if(use_ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);for(uint32_t b=0;b<h.nlist;++b){auto p=center_view(index_base(s.table,h),b,queries[distance_expr].size());distances.emplace_back(l2(queries[distance_expr].data(),p,queries[distance_expr].size()),b);}std::sort(distances.begin(),distances.end());for(size_t i=0;i<distances.size();++i)buckets.push_back(distances[i].second);}
+  if(s.limit==0)return result;
+  size_t preferred=cols.size();
+  for(auto c:selected)if(cols[c].type==Type::Vector){preferred=c;break;}
+  if(use_ivf)preferred=h.ivector;
+  BufferPool::PageGuard lease;
+  uint64_t leased_page=UINT64_MAX;
+  auto payload=[&](SlotId slot,size_t c){
+    if(c!=preferred)return vector_view(s.table,slot,c,cols[c]);
+    auto count=PAGE/stride(cols[c]);auto page=slot/count;
+    if(leased_page!=page){lease.reset();lease=storage.pool.lease(s.table+".v"+std::to_string(c),page);leased_page=page;}
+    return reinterpret_cast<const float*>(lease.data+(slot%count)*stride(cols[c]));
+  };
+      uint64_t accepted_rows=0;uint32_t first_bucket=0,scan_end=last_probes;const char* expand_mode=std::getenv("MVDB_FILTER_EXPAND");
+      do {
+        for(uint64_t start=0;start<h.slots;start+=4096){std::array<uint64_t,64> candidates{};
+          if(use_ivf){for(uint32_t bi=first_bucket;bi<scan_end;++bi){auto b=buckets[bi];auto list=posting_list(index_base(s.table,h),b);uint64_t loaded=UINT64_MAX;Page page{};for(uint32_t i=0;i<list.count;++i){uint64_t offset=list.offset+uint64_t(i)*4;if(loaded!=offset/PAGE){loaded=offset/PAGE;page=storage.read(list.file,loaded);}uint32_t slot;std::memcpy(&slot,page.data()+offset%PAGE,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
+          else candidates.fill(UINT64_MAX);
+          ++bitmap_blocks;auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));for(size_t word=0;word<64;++word){uint64_t bits;std::memcpy(&bits,valid+(start%(PAGE*8))/8+word*8,8);candidates[word]&=bits;}signature_filter(start,candidates);
+          each_set_bit(candidates,0,std::min<uint64_t>(4096,h.slots-start),[&](size_t at){++candidate_slots;auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);if(!m.active)return;
+            if(!predicates.empty()&&!matches_slot(slot,m))return;
+            ++accepted_rows;if(order_scalars)scalar_row(slot,m);
+            for(size_t j=0;j<order.size();++j){auto i=order[j].first;auto c=i<projected?selected[i]:i-projected;
+              if(i<projected&&expressions[i].distance){auto p=payload(slot,c);keys[j]=l2_exact(p,queries[i].data(),cols[c].width);}
+              else if(c==keycol)keys[j]=m.key;else keys[j]=scalars[c];
+            }
+            keys[order.size()]=m.key;keys.back()=int64_t(slot);
+            if(use_heap){if(heap.size()<s.limit){heap.push_back(keys);std::push_heap(heap.begin(),heap.end(),less);}else if(less(keys,heap.front())){std::pop_heap(heap.begin(),heap.end(),less);heap.back()=keys;std::push_heap(heap.begin(),heap.end(),less);}}
+            else sorter->add(keys);
+          });
+        }
+        if(!use_ivf||predicates.empty()||accepted_rows>=s.limit||scan_end>=h.nlist||(expand_mode&&std::string_view(expand_mode)=="off"))break;
+        first_bucket=scan_end;scan_end=++last_probes;lease.reset();leased_page=UINT64_MAX;
+      }while(true);
+      lease.reset();leased_page=UINT64_MAX;
+      result.rows=storage.temporary();uint64_t returned=0;
+      auto materialize=[&](const std::vector<Value>& identity){auto slot=static_cast<SlotId>(std::get<int64_t>(identity.back()));auto m=meta(s.table,slot);if(output_scalars)scalar_row(slot,m);
+        for(size_t i=0;i<projected;++i){auto c=selected[i];if(expressions[i].distance){
+          // ORDER keys already contain this expression's exact displayed distance.
+          // Reuse it instead of rereading winner pages after the candidate scan.
+          size_t ranked=0;while(ranked<order.size()&&order[ranked].first!=i)++ranked;
+          if(ranked<order.size())output[i]=identity[ranked];
+          else {auto p=vector_view(s.table,slot,c,cols[c]);output[i]=l2_exact(p,queries[i].data(),cols[c].width);}}
+          else if(c==keycol)output[i]=m.key;
+          else if(cols[c].type==Type::Vector){if(!std::holds_alternative<std::vector<float>>(output[i]))output[i].emplace<std::vector<float>>();auto& v=std::get<std::vector<float>>(output[i]);v.resize(cols[c].width);auto p=vector_view(s.table,slot,c,cols[c]);std::copy_n(p,cols[c].width,v.begin());}
+          else output[i]=scalars[c];
+        }spill_write(result.rows.get(),output,&packed);++returned;
+      };
+      if(use_heap){std::sort(heap.begin(),heap.end(),less);for(auto& identity:heap)materialize(identity);}
+      else {auto sorted=sorter->finish();std::string key_blob;while(returned<s.limit&&spill_read(sorted.get(),keys,&key_blob))materialize(keys);discard_cache(sorted.get());}
+      discard_cache(result.rows.get());result.memory_reservation=std::move(workspace);return result;
     }
   }
   const size_t projected=expressions.size(),pkpos=projected+cols.size();
@@ -1160,7 +1336,7 @@ Result Engine::execute_inner(const Statement& s){
     auto end=std::min<uint64_t>(4096,h.slots-start);
     each_set_bit(candidates,0,end,[&](size_t at){auto slot=static_cast<SlotId>(start+at);auto mask=uint64_t(1)<<(at%64);auto& word=candidates[at/64];
       ++candidate_slots;bool yes=true;
-      if(yes&&!predicates.empty()){auto m=meta(s.table,slot);yes=m.active&&matches(row(s.table,slot,m,cols,false));}if(!yes)word&=~mask;
+      if(yes&&!predicates.empty()){auto m=meta(s.table,slot);yes=matches_slot(slot,m);}if(!yes)word&=~mask;
     });
     each_set_bit(candidates,0,end,[&](size_t at){auto slot=static_cast<SlotId>(start+at);
       ++accepted_rows;

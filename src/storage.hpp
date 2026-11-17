@@ -46,7 +46,7 @@ class BufferPool {
   // Frame unchanged preserves the frame count at every memory budget.
   std::vector<std::unique_ptr<std::byte,PageDeleter>> pages;
   uint64_t clock=0;
-  size_t reservation=0;
+  size_t reservation=0,base_frames=0,extra_reservation=0;
   std::unordered_map<std::string,size_t> lookup;
   std::unordered_map<std::string,int> descriptors;
   int descriptor(const std::string&);
@@ -91,6 +91,11 @@ public:
   bool release_clean_page(const std::string&,uint64_t);
   bool release_clean_file(const std::string&);
   uint64_t clean_page_releases=0,residency_refusals=0,cache_drop_calls=0,frame_evictions=0;
+  // Optional 8MiB read capacity, fully charged before allocating containers.
+  // Ordinary DML can reclaim it after releasing read-cache/lease references.
+  bool grow_read_cache(size_t vector_pages,size_t headroom);
+  bool shrink_read_cache();
+  bool has_read_cache_growth() const noexcept {return extra_reservation!=0;}
   size_t frame_capacity() const noexcept {return frames.size();}
   size_t resident_page_count() const noexcept {
     size_t n=0;for(const auto& f:frames)if(f.valid)++n;return n;
@@ -214,6 +219,7 @@ class PrimaryIndex {
 public:
   PrimaryIndex(Storage& s,std::string f):storage(s),file(std::move(f)){}
   std::optional<SlotId> find(int64_t);
+  std::optional<std::pair<int64_t,SlotId>> lower_bound(int64_t);
   void insert(int64_t,SlotId);
   void erase(int64_t);
 };

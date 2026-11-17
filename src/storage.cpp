@@ -146,11 +146,57 @@ BufferPool::BufferPool(std::filesystem::path path,MemoryBudget& b):directory(std
   size_t allocation=b.limit>8*1024*1024 ? b.limit-b.limit/4 : b.limit/2;
   size_t count=std::max<size_t>(3,allocation/(PAGE+sizeof(Frame)+384));
   require(count>=2,"buffer budget needs at least two frames");
-  reservation=count*(PAGE+sizeof(Frame)+384);budget.acquire(reservation);
+  base_frames=count;reservation=count*(PAGE+sizeof(Frame)+384);budget.acquire(reservation);
   try{frames.resize(count);pages.resize(count);lookup.reserve(count);descriptors.reserve(std::min<size_t>(16,count));}
   catch(...){budget.release(reservation);throw;}
 }
-BufferPool::~BufferPool() {for(auto& entry:descriptors)::close(entry.second);budget.release(reservation);}
+BufferPool::~BufferPool() {for(auto& entry:descriptors)::close(entry.second);budget.release(reservation+extra_reservation);}
+bool BufferPool::grow_read_cache(size_t vector_pages,size_t headroom){
+  if(budget.limit!=8*1024*1024||transaction_active||!vector_pages||
+     vector_pages>budget.limit/PAGE||headroom>budget.limit/PAGE-vector_pages)return false;
+  const size_t target=vector_pages+headroom;
+  if(target<=frames.size())return true;
+  if(extra_reservation)return false;
+  // The base reservation continues to cover the old containers while complete
+  // replacements are allocated. Charge all new metadata, including copied
+  // strings/map nodes/buckets, plus every additional page's future backing.
+  const size_t charge=(target-frames.size())*PAGE+
+    target*(sizeof(Frame)+sizeof(decltype(pages)::value_type)+384);
+  if(charge+2*PAGE>budget.limit-budget.used)return false;
+  budget.acquire(charge);
+  try{
+    std::vector<Frame> replacement(target);
+    std::copy(frames.begin(),frames.end(),replacement.begin());
+    for(size_t i=frames.size();i<target;++i)replacement[i].version=++clock;
+    decltype(pages) backing(target);
+    decltype(lookup) directory;directory.reserve(target);
+    for(const auto& entry:lookup)directory.emplace(entry);
+    // No throwing operations remain; borrowed base-page addresses stay fixed.
+    for(size_t i=0;i<pages.size();++i)backing[i]=std::move(pages[i]);
+    frames.swap(replacement);pages.swap(backing);lookup.swap(directory);
+    extra_reservation=charge;return true;
+  }catch(...){budget.release(charge);return false;}
+}
+bool BufferPool::shrink_read_cache(){
+  if(!extra_reservation)return true;
+  for(size_t i=base_frames;i<frames.size();++i){
+    const auto& f=frames[i];if(f.pins||f.dirty||f.uncommitted)return false;
+  }
+  try{
+    // The still-held base+extra reservations cover both compact and expanded
+    // metadata during this transfer. On failure every original frame survives.
+    {
+    std::vector<Frame> replacement(base_frames);
+    std::copy_n(frames.begin(),base_frames,replacement.begin());
+    decltype(pages) backing(base_frames);
+    decltype(lookup) directory;directory.reserve(base_frames);
+    for(const auto& entry:lookup)if(entry.second<base_frames)directory.emplace(entry);
+    for(size_t i=0;i<base_frames;++i)backing[i]=std::move(pages[i]);
+    frames.swap(replacement);pages.swap(backing);lookup.swap(directory);
+    } // Destroy old containers/backing before returning their entire charge.
+    budget.release(extra_reservation);extra_reservation=0;return true;
+  }catch(...){return false;}
+}
 int BufferPool::descriptor(const std::string& file){auto it=descriptors.find(file);if(it!=descriptors.end())return it->second;
   if(descriptors.size()>=std::min<size_t>(16,frames.size())){auto victim=descriptors.begin();::close(victim->second);descriptors.erase(victim);}
   int fd=page_fd(directory/file);descriptors.emplace(file,fd);return fd;
@@ -672,6 +718,26 @@ std::optional<SlotId> PrimaryIndex::find(int64_t key) {
       return {};}
     auto i=std::upper_bound(n.keys,n.keys+n.n,key)-n.keys;p=n.children[i];
   }return {};
+}
+std::optional<std::pair<int64_t,SlotId>> PrimaryIndex::lower_bound(int64_t key){
+  struct Parent {uint32_t page,child;};std::array<Parent,32> parents{};size_t depth=0;
+  uint32_t page=storage.load<Header>(file,0).root;
+  while(page){
+    const auto* node=reinterpret_cast<const Node*>(storage.pool.view(file,page));
+    require(node->n<=ORDER,"corrupt primary index node");
+    if(node->leaf){auto i=std::lower_bound(node->keys,node->keys+node->n,key)-node->keys;
+      if(i<node->n)return std::pair<int64_t,SlotId>{node->keys[i],node->slots[i]};
+      page=0;
+      while(depth){auto& parent=parents[depth-1];const auto* n=reinterpret_cast<const Node*>(storage.pool.view(file,parent.page));
+        require(n->n<=ORDER,"corrupt primary index node");
+        if(parent.child<n->n){page=n->children[++parent.child];break;}--depth;}
+    }else{
+      require(depth<parents.size(),"primary index depth exceeded");
+      auto child=static_cast<uint32_t>(std::upper_bound(node->keys,node->keys+node->n,key)-node->keys);
+      parents[depth++]={page,child};page=node->children[child];
+    }
+  }
+  return {};
 }
 uint32_t PrimaryIndex::allocate(const Node& n) {
   auto h=storage.load<Header>(file,0);if(h.next==0)h.next=1;

@@ -160,6 +160,11 @@ struct Parser {
     do{need("(");tuple.clear();do{if(tuple.size()>=max_columns)error("INSERT width mismatch");tuple.push_back(literal_view());}while(accept(","));need(")");row(tuple);}while(accept(","));finish();
   }
   void where(Statement& s){if(!accept("where"))return;do{Condition c;c.column=name();auto op=take();if(op.quoted)error("expected comparison operator");c.op=op.str();
+    if(op.equals("between")){
+      auto low=literal();need("and");auto high=literal();
+      s.conditions.push_back({c.column,">=",std::move(low.text),low.quoted});
+      s.conditions.push_back({c.column,"<=",std::move(high.text),high.quoted});continue;
+    }
     if(c.op!="="&&c.op!="!="&&c.op!="<>"&&c.op!="<"&&c.op!=">"&&c.op!="<="&&c.op!=">=")error("invalid comparison");
     auto v=literal();c.literal=std::move(v.text);c.quoted=v.quoted;s.conditions.push_back(std::move(c));
   }while(accept("and"));}
