@@ -190,8 +190,14 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
   uint32_t count=0;for(SlotId slot=0;slot<h.slots;++slot)if(meta(s.table,slot).active)++count;
   h.nlist=std::min<uint32_t>(count>=4096?64:8,count);h.ivector=static_cast<uint32_t>(col);require(h.nlist>0,"cannot train IVF on empty table");
   const auto dim=cols[col].width;
-  const size_t full_workspace=h.nlist*dim*(sizeof(double)+sizeof(float))+1024;
-  const size_t narrow_workspace=h.nlist*dim*sizeof(float)*2+dim*sizeof(double)+1024;
+  // Opt in for clustered ANN workloads; retain the full training policy by default.
+  const char* mode=std::getenv("MVDB_IVF_SAMPLED_TRAINING");
+  const bool sampled_training=dim==128&&mode&&std::string_view(mode)=="1";
+  const uint32_t train_count=sampled_training?std::min<uint32_t>(count,2560):count;
+  const bool batch4=sampled_training;
+  const size_t packed_bytes=batch4?size_t(h.nlist)*dim*sizeof(float):0;
+  const size_t full_workspace=h.nlist*dim*(sizeof(double)+sizeof(float))+8192+packed_bytes;
+  const size_t narrow_workspace=h.nlist*dim*sizeof(float)*2+dim*sizeof(double)+8192+packed_bytes;
   if(std::min(full_workspace,narrow_workspace)>storage.budget.limit-storage.budget.used){
     // Value 2 is a persistent Exact-only index. No training or unpublished
     // region is allocated; ordinary transactional header Undo/WAL publishes it.
@@ -210,15 +216,22 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
   std::memcpy(h.index_region,region.c_str(),region.size()+1);h.active_count=count;
   {
   constexpr size_t reseed_bytes=sizeof(std::pair<double,SlotId>)*64+sizeof(uint32_t)*64;
-  size_t full=h.nlist*dim*(sizeof(double)+sizeof(float))+1024;
+  size_t full=full_workspace;
   bool narrow=full>storage.budget.limit-storage.budget.used;
-  size_t training_bytes=narrow?h.nlist*dim*sizeof(float)*2+dim*sizeof(double)+1024:full;
+  size_t training_bytes=narrow?narrow_workspace:full;
   const bool reseed_enabled=training_bytes+reseed_bytes<=storage.budget.limit-storage.budget.used;
   if(reseed_enabled)training_bytes+=reseed_bytes;
   Reservation reserve(storage.budget,training_bytes);
   std::vector<std::vector<float>> centers;uint32_t ordinal=0,next=0;
   for(SlotId slot=0;slot<h.slots&&centers.size()<h.nlist;++slot)if(meta(s.table,slot).active){if(ordinal==next){auto p=vector_view(s.table,slot,col,cols[col]);centers.emplace_back(p,p+dim);next=static_cast<uint32_t>(centers.size()*count/h.nlist);}++ordinal;}
+  // The packed copy permits the existing adjacent-row batch4 kernel to score
+  // four centers together. Its full allocation is charged before admission.
+  std::vector<float> packed_centers(batch4?size_t(h.nlist)*dim:0);
+  auto pack_centers=[&](){if(batch4)for(uint32_t b=0;b<h.nlist;++b)std::copy(centers[b].begin(),centers[b].end(),packed_centers.begin()+size_t(b)*dim);};
+  // One deterministic active row per ordinal stratum, including all small tables.
+  auto sampled=[&](uint32_t ordinal){return uint64_t(ordinal+1)*train_count/count!=uint64_t(ordinal)*train_count/count;};
   for(int iteration=0;iteration<3;++iteration){
+    pack_centers();
     std::vector<bool> safe;for(auto& center:centers)safe.push_back(!has_extreme(center.data(),dim));
     // Keep only at most nlist farthest input ordinals during the existing
     // assignment pass. Empty-cluster repair never adds a full vector scan.
@@ -228,7 +241,11 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
       if(farthest_count<h.nlist){farthest[farthest_count++]=entry;std::push_heap(farthest.begin(),farthest.begin()+farthest_count,farther);}
       else if(farther(entry,farthest[0])){std::pop_heap(farthest.begin(),farthest.begin()+farthest_count,farther);farthest[farthest_count-1]=entry;std::push_heap(farthest.begin(),farthest.begin()+farthest_count,farther);}
     };
-    auto nearest=[&](const float* p,bool normal,double* chosen=nullptr){uint32_t best=0;double distance=INFINITY;for(uint32_t b=0;b<h.nlist;++b){auto d=l2_fast(p,centers[b].data(),dim,normal&&safe[b]);if(d<distance){distance=d;best=b;}}if(chosen)*chosen=distance;return best;};
+    auto nearest=[&](const float* p,bool normal,double* chosen=nullptr){uint32_t best=0,b=0;double distance=INFINITY;
+      if(batch4)for(;b+4<=h.nlist;b+=4){double ds[4];l2_squared_batch4_128(packed_centers.data()+size_t(b)*dim,p,ds,normal&&safe[b]&&safe[b+1]&&safe[b+2]&&safe[b+3]);
+        for(uint32_t k=0;k<4;++k){auto d=std::sqrt(ds[k]);if(d<distance){distance=d;best=b+k;}}}
+      for(;b<h.nlist;++b){auto d=l2_fast(p,centers[b].data(),dim,normal&&safe[b]);if(d<distance){distance=d;best=b;}}
+      if(chosen)*chosen=distance;return best;};
     auto reseed=[&](auto& next,const auto& sizes){
       if(!reseed_enabled||std::none_of(sizes.begin(),sizes.end(),[](auto n){return n==0;}))return;
       std::sort(farthest.begin(),farthest.begin()+farthest_count,farther);
@@ -241,22 +258,26 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
     if(narrow){
       auto next=centers;std::array<uint32_t,64> sizes{};
       for(uint32_t b=0;b<h.nlist;++b){std::vector<double> sum(dim);uint32_t count_in_bucket=0;
-        for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);if(!m.active)continue;auto p=vector_view(s.table,slot,col,cols[col]);double distance;auto best=nearest(p,m.reserved==0,&distance);if(b==0)remember(distance,slot);if(best!=b)continue;++count_in_bucket;for(size_t j=0;j<dim;++j)sum[j]+=p[j];}
+        uint32_t train_ordinal=0;for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);if(!m.active)continue;if(!sampled(train_ordinal++))continue;auto p=vector_view(s.table,slot,col,cols[col]);double distance;auto best=nearest(p,m.reserved==0,&distance);if(b==0)remember(distance,slot);if(best!=b)continue;++count_in_bucket;for(size_t j=0;j<dim;++j)sum[j]+=p[j];}
         sizes[b]=count_in_bucket;
         if(count_in_bucket)for(size_t j=0;j<dim;++j)next[b][j]=static_cast<float>(sum[j]/count_in_bucket);
       }reseed(next,std::span<const uint32_t>(sizes.data(),h.nlist));centers.swap(next);
     }else{
       std::vector<std::vector<double>> sums(h.nlist,std::vector<double>(dim));std::vector<uint32_t> sizes(h.nlist);
-      for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);if(!m.active)continue;auto p=vector_view(s.table,slot,col,cols[col]);double distance;auto best=nearest(p,m.reserved==0,&distance);remember(distance,slot);++sizes[best];for(size_t j=0;j<dim;++j)sums[best][j]+=p[j];}
+      uint32_t train_ordinal=0;for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);if(!m.active)continue;if(!sampled(train_ordinal++))continue;auto p=vector_view(s.table,slot,col,cols[col]);double distance;auto best=nearest(p,m.reserved==0,&distance);remember(distance,slot);++sizes[best];for(size_t j=0;j<dim;++j)sums[best][j]+=p[j];}
       for(uint32_t b=0;b<h.nlist;++b)if(sizes[b])for(size_t j=0;j<dim;++j)centers[b][j]=static_cast<float>(sums[b][j]/sizes[b]);
       reseed(centers,sizes);
     }
   }
   for(uint32_t b=0;b<h.nlist;++b){auto count=PAGE/stride(cols[col]);auto page=storage.read(region+".centers",b/count);std::memcpy(page.data()+(b%count)*stride(cols[col]),centers[b].data(),dim*4);storage.write_new(region+".centers",b/count,page);}
   std::vector<bool> safe;for(auto& center:centers)safe.push_back(!has_extreme(center.data(),dim));
+  pack_centers();
   std::array<uint32_t,64> sizes{};Page assignments{};
   for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);uint32_t b=UINT32_MAX;if(m.active){b=0;auto p=vector_view(s.table,slot,col,cols[col]);double nearest=INFINITY;
-    for(uint32_t candidate=0;candidate<h.nlist;++candidate){auto distance=l2_fast(p,centers[candidate].data(),dim,m.reserved==0&&safe[candidate]);if(distance<nearest){nearest=distance;b=candidate;}}
+    uint32_t candidate=0;
+    if(batch4)for(;candidate+4<=h.nlist;candidate+=4){double ds[4];l2_squared_batch4_128(packed_centers.data()+size_t(candidate)*dim,p,ds,m.reserved==0&&safe[candidate]&&safe[candidate+1]&&safe[candidate+2]&&safe[candidate+3]);
+      for(uint32_t k=0;k<4;++k){auto distance=std::sqrt(ds[k]);if(distance<nearest){nearest=distance;b=candidate+k;}}}
+    for(;candidate<h.nlist;++candidate){auto distance=l2_fast(p,centers[candidate].data(),dim,m.reserved==0&&safe[candidate]);if(distance<nearest){nearest=distance;b=candidate;}}
     ++sizes[b];}std::memcpy(assignments.data()+(slot%(PAGE/4))*4,&b,4);
     if(slot%(PAGE/4)==PAGE/4-1||slot+1==h.slots){storage.write_new(region+".buckets",slot/(PAGE/4),assignments);assignments={};}}
   PackedDirectory directory;directory.next=(sizeof(directory)+3)/4;
@@ -268,7 +289,9 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
     std::memcpy(packed.data()+offset%PAGE,&slot,4);offset+=4;if(offset%PAGE==0){storage.write_new(region+".ivf",page_id++,packed);packed={};}}
   if(offset%PAGE)storage.write_new(region+".ivf",page_id,packed);
   }
-  h.calibration_skipped=detail::skip_ivf_calibration_for_payload(count,uint64_t(count)*dim*sizeof(float),storage.budget.limit);
+  // calibrate() streams pages and owns only 16 query vectors; use its actual
+  // workspace admission instead of rejecting payloads larger than half budget.
+  h.calibration_skipped=(!sampled_training||storage.budget.limit<4*1024*1024)&&detail::skip_ivf_calibration_for_payload(count,uint64_t(count)*dim*sizeof(float),storage.budget.limit);
   h.calibration_queries=h.calibration_skipped?0:16;
   h.recommended_nprobe=h.calibration_skipped?std::min(h.nlist,std::max<uint32_t>(4,h.nlist/4)):calibrate(s.table,h,cols);h.calibration_stale=0;
   h.mutations_since_calibration=0;h.rows_at_calibration=count;
@@ -462,6 +485,18 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   if(workspace>storage.budget.limit-storage.budget.used){read_cache.reset();return false;}
   std::optional<Reservation> reservation;reservation.emplace(storage.budget,workspace);
   storage.pool.grow_read_cache(c->vector_pages.size(),32);
+  // Acquire all guards and hand each clean committed page off as it is loaded,
+  // rather than waiting until the complete extra anonymous working set peaks.
+  const char* handoff=std::getenv("MVDB_READONLY_CACHE_HANDOFF");
+  if(handoff&&std::string_view(handoff)=="1"&&storage.budget.limit==8*1024*1024&&
+     storage.pool.has_read_cache_growth()&&!prepared_vectors&&!storage.pool.transaction_active){
+    auto file=s.table+".v"+std::to_string(selected[distance]);
+    prepared_vectors=storage.pool.load_residency(file,c->vector_pages.size(),32);
+    if(prepared_vectors){prepared_table=s.table;
+      for(size_t p=0;p<c->vector_pages.size();++p)c->vector_pages[p]=storage.pool.handle(file,p);
+    }
+  }
+
   // Validate without loading: loading one missing page could evict any earlier
   // borrowed address. The all-resident scan below makes no pool calls at all.
   std::vector<const std::byte*> local_bases;
@@ -1162,6 +1197,52 @@ Result Engine::execute_inner(const Statement& s){
       return result;
     }
   }
+  if(storage.budget.limit<2*1024*1024&&primary_order&&
+     expressions.size()==2&&s.limit>0&&s.limit<=10){
+    size_t vector_expression=2;bool eligible=true;
+    for(size_t i=0;i<2;++i){if(expressions[i].distance){eligible=false;break;}
+      if(selected[i]!=keycol){if(cols[selected[i]].type!=Type::Vector||cols[selected[i]].width!=128||vector_expression!=2)eligible=false;else vector_expression=i;}}
+    struct Identity {int64_t key;SlotId slot;};
+    constexpr size_t workspace=64*(sizeof(Meta)+sizeof(SlotId))+64*sizeof(uint64_t)+10*sizeof(Identity)+2048;
+    if(eligible&&vector_expression<2&&workspace<=storage.budget.limit-storage.budget.used){
+      auto memory=std::make_shared<Reservation>(storage.budget,workspace);
+      std::array<Identity,10> heap{};size_t heap_size=0;
+      std::array<Meta,64> metadata{};std::array<SlotId,64> slots{};std::array<uint64_t,64> visible{};
+      auto less=[&](const Identity& a,const Identity& b){return descending?a.key>b.key:a.key<b.key;};
+      ++projection_direct;
+      for(uint64_t start=0;start<h.slots;start+=4096){
+        ++bitmap_blocks;auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));
+        std::memcpy(visible.data(),valid+(start%(PAGE*8))/8,sizeof(visible));
+        signature_filter(start,visible);const auto end=std::min<uint64_t>(4096,h.slots-start);
+        for(size_t offset=0;offset<end;offset+=64){auto mask=visible[offset/64];if(!mask)continue;
+          const auto first=start+offset,n=std::min<uint64_t>(64,end-offset);
+          auto rows=storage.pool.view(s.table+".rows",first/(PAGE/sizeof(Meta)));
+          std::memcpy(metadata.data(),rows+(first%(PAGE/sizeof(Meta)))*sizeof(Meta),n*sizeof(Meta));
+          size_t count=0;while(mask){auto bit=std::countr_zero(mask);mask&=mask-1;if(bit<n)slots[count++]=bit;}
+          for(size_t j=0;j<count;++j){auto bit=slots[j];auto slot=static_cast<SlotId>(first+bit);auto& m=metadata[bit];
+            ++metadata_reads;++candidate_slots;++projection_scanned;
+            if(!m.active||(!predicates.empty()&&!matches_slot(slot,m)))continue;
+            Identity next{m.key,slot};
+            if(heap_size<s.limit){heap[heap_size++]=next;std::push_heap(heap.begin(),heap.begin()+heap_size,less);}
+            else if(less(next,heap[0])){std::pop_heap(heap.begin(),heap.begin()+heap_size,less);heap[heap_size-1]=next;std::push_heap(heap.begin(),heap.begin()+heap_size,less);}
+          }
+        }
+      }
+      std::sort(heap.begin(),heap.begin()+heap_size,less);
+      const size_t snapshot_bytes=64+heap_size*(sizeof(std::vector<Value>)+2*sizeof(Value)+128*sizeof(float)+64);
+      if(snapshot_bytes<=storage.budget.limit-storage.budget.used){storage.budget.acquire(snapshot_bytes);memory->n+=snapshot_bytes;
+        result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>();result.memory_rows->reserve(heap_size);
+      }else result.rows=storage.temporary();
+      std::vector<Value> output(2);std::string packed;
+      const auto c=selected[vector_expression];
+      for(size_t j=0;j<heap_size;++j){auto winner=heap[j];output[1-vector_expression]=winner.key;
+        auto p=vector_view(s.table,winner.slot,c,cols[c]);output[vector_expression]=std::vector<float>(p,p+128);
+        if(result.memory_rows)result.memory_rows->push_back(output);else spill_write(result.rows.get(),output,&packed);
+      }
+      if(result.rows)discard_cache(result.rows.get());result.memory_reservation=std::move(memory);last_probes=0;
+      route=ann&&h.calibration_skipped==2?"exact_fallback":"exact";return result;
+    }
+  }
   // Retain physical identities while ranking by the primary key. Projected
   // vectors, strings and distance expressions are needed only for final winners.
   if(primary_order&&s.limit<=4096){
@@ -1294,16 +1375,59 @@ Result Engine::execute_inner(const Statement& s){
           if(use_ivf){for(uint32_t bi=first_bucket;bi<scan_end;++bi){auto b=buckets[bi];auto list=posting_list(index_base(s.table,h),b);uint64_t loaded=UINT64_MAX;Page page{};for(uint32_t i=0;i<list.count;++i){uint64_t offset=list.offset+uint64_t(i)*4;if(loaded!=offset/PAGE){loaded=offset/PAGE;page=storage.read(list.file,loaded);}uint32_t slot;std::memcpy(&slot,page.data()+offset%PAGE,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
           else candidates.fill(UINT64_MAX);
           ++bitmap_blocks;auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));for(size_t word=0;word<64;++word){uint64_t bits;std::memcpy(&bits,valid+(start%(PAGE*8))/8+word*8,8);candidates[word]&=bits;}signature_filter(start,candidates);
-          each_set_bit(candidates,0,std::min<uint64_t>(4096,h.slots-start),[&](size_t at){++candidate_slots;auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);if(!m.active)return;
-            if(!predicates.empty()&&!matches_slot(slot,m))return;
+          auto consume_filtered=[&](SlotId slot,const Meta& m,double computed=-1.0){
             ++accepted_rows;if(order_scalars)scalar_row(slot,m);
             for(size_t j=0;j<order.size();++j){auto i=order[j].first;auto c=i<projected?selected[i]:i-projected;
-              if(i<projected&&expressions[i].distance){auto p=payload(slot,c);keys[j]=l2_exact(p,queries[i].data(),cols[c].width);}
+              if(i<projected&&expressions[i].distance){if(j==0&&computed>=0)keys[j]=computed;else {auto p=payload(slot,c);keys[j]=l2_exact(p,queries[i].data(),cols[c].width);}}
               else if(c==keycol)keys[j]=m.key;else keys[j]=scalars[c];
             }
             keys[order.size()]=m.key;keys.back()=int64_t(slot);
             if(use_heap){if(heap.size()<s.limit){heap.push_back(keys);std::push_heap(heap.begin(),heap.end(),less);}else if(less(keys,heap.front())){std::pop_heap(heap.begin(),heap.end(),less);heap.back()=keys;std::push_heap(heap.begin(),heap.end(),less);}}
             else sorter->add(keys);
+          };
+          const bool range_filter=std::any_of(s.conditions.begin(),s.conditions.end(),[](const auto& condition){
+            return condition.op=="<"||condition.op=="<="||condition.op==">"||condition.op==">=";
+          });
+          const size_t page_workspace=32*(sizeof(Meta)+sizeof(SlotId))+4*(sizeof(double)+sizeof(const float*));
+          bool page_scan=range_filter&&!use_ivf&&use_heap&&!order_scalars&&
+            !predicates.empty()&&!order.empty()&&!order[0].second&&order[0].first<projected&&
+            expressions[order[0].first].distance&&cols[selected[order[0].first]].width==128&&
+            page_workspace<=storage.budget.limit-storage.budget.used;
+          if(page_scan){
+            Reservation page_memory(storage.budget,page_workspace);
+            lease.reset();leased_page=UINT64_MAX;
+            const auto dc=selected[order[0].first];const auto file=s.table+".v"+std::to_string(dc);
+            const auto& query=queries[order[0].first];const bool safe_query=!has_extreme(query.data(),128);
+            std::array<Meta,32> metadata{};std::array<SlotId,32> slots{};
+            auto end=std::min<uint64_t>(4096,h.slots-start);
+            for(size_t offset=0;offset<end;offset+=32){
+              uint32_t mask=uint32_t(candidates[offset/64]>>(offset%64));if(!mask){continue;}
+              const auto first=start+offset,n=std::min<uint64_t>(32,end-offset);
+              auto rows=storage.pool.view(s.table+".rows",first/(PAGE/sizeof(Meta)));
+              std::memcpy(metadata.data(),rows+(first%(PAGE/sizeof(Meta)))*sizeof(Meta),n*sizeof(Meta));
+              size_t count=0;while(mask){auto bit=std::countr_zero(mask);mask&=mask-1;if(bit>=n)continue;
+                ++candidate_slots;++metadata_reads;auto& m=metadata[bit];
+                if(m.active&&matches_slot(static_cast<SlotId>(first+bit),m))slots[count++]=bit;
+              }
+              if(!count){continue;}
+
+              auto vector_page=storage.pool.lease(file,first/32);
+              const float* pointers[4]{};double squared[4]{};
+              for(size_t at=0;at<count;at+=4){auto batch=std::min<size_t>(4,count-at);bool safe=safe_query;
+                for(size_t r=0;r<batch;++r){pointers[r]=reinterpret_cast<const float*>(vector_page.data+slots[at+r]*512);safe&=!has_extreme(pointers[r],128);}
+                for(size_t r=0;r<batch;++r)squared[r]=l2_squared_fast(pointers[r],query.data(),128,safe);
+                for(size_t r=0;r<batch;++r){
+                  if(heap.size()==s.limit){auto worst=std::get<double>(heap.front()[0]);worst*=worst;
+                    const double error=std::max(1e-5,4.0*128*std::numeric_limits<float>::epsilon());
+                    if(squared[r]>worst+error*std::max({1.0,std::abs(squared[r]),std::abs(worst)})){++accepted_rows;continue;}
+                  }
+                  auto bit=slots[at+r];consume_filtered(static_cast<SlotId>(first+bit),metadata[bit],l2_exact(pointers[r],query.data(),128));
+                }
+              }
+            }
+          }else each_set_bit(candidates,0,std::min<uint64_t>(4096,h.slots-start),[&](size_t at){
+            ++candidate_slots;auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);
+            if(m.active&&(predicates.empty()||matches_slot(slot,m)))consume_filtered(slot,m);
           });
         }
         if(!use_ivf||predicates.empty()||accepted_rows>=s.limit||scan_end>=h.nlist||(expand_mode&&std::string_view(expand_mode)=="off"))break;
