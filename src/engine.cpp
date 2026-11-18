@@ -708,12 +708,14 @@ void Engine::observe_read_table(std::string_view table){
   repeated_read=!table.empty() && read_table==table;
   if(repeated_read)return;
   storage.pool.release_prefix();
+  hash_directory.reset();hash_streak=0;hash_column=SIZE_MAX;
   zone_map.reset();
   unsupported_columns=0;
   read_table.assign(table);
 }
 Result Engine::execute(std::string_view sql){
   try {
+  ++statement_number;
   last_probes=last_lists=last_recommended=0;route="none";
   if(is_insert(sql)){
     observe_read_table({});
@@ -1279,17 +1281,22 @@ Result Engine::execute_inner(const Statement& s){
     // If resident output is too large, sort only (key, slot), then encode one winner at a time.
     // Include the one-row serializer, unpacked scalar values and output in the charge.
     bool compact_projection=false,measured_projection=false;
-    if(storage.budget.limit<=65536&&s.limit>0&&s.limit<=50&&
+    constexpr size_t identity_quota=8*1024;
+    const bool streamed_shape=expressions.size()==3&&scalar_predicates&&
+      !expressions[0].distance&&!expressions[1].distance&&!expressions[2].distance&&
+      selected[0]==keycol&&cols[selected[1]].type==Type::Varchar&&
+      cols[selected[2]].type==Type::Vector&&cols[selected[2]].width==128;
+    const bool budgeted_projection=storage.budget.limit<=128*1024&&streamed_shape&&
+      s.limit>0&&s.limit<=identity_quota/sizeof(Winner);
+    const size_t heap_bytes=s.limit*sizeof(Winner);
+    if(((storage.budget.limit<=65536&&s.limit>0&&s.limit<=50)||budgeted_projection)&&
        retained>(storage.budget.limit-storage.budget.used)*3/4){
       size_t scratch=2048+3*row_bytes+cols.size()*3*sizeof(Value);
       for(auto& c:cols)if(c.type==Type::Varchar)scratch+=2*(size_t(c.width)*4+1);
       size_t compact=scratch+s.limit*sizeof(Winner);
       if(compact<=(storage.budget.limit-storage.budget.used)*3/4){
         retained=compact;compact_projection=true;++projection_direct;
-      }else if(expressions.size()==3&&scalar_predicates&&
-               !expressions[0].distance&&!expressions[1].distance&&!expressions[2].distance&&
-               selected[0]==keycol&&cols[selected[1]].type==Type::Varchar&&
-               cols[selected[2]].type==Type::Vector&&cols[selected[2]].width==128){
+      }else if(streamed_shape){
         // The declared UTF-8 bound exceeds the pool. Check the winners' real
         // scalar record lengths before allocating or emitting any output.
         retained=1024+s.limit*sizeof(Winner);
@@ -1297,7 +1304,8 @@ Result Engine::execute_inner(const Statement& s){
       }
     }
     if(retained>(storage.budget.limit-storage.budget.used)*3/4&&read_cache)read_cache.reset();
-    if(retained<=(storage.budget.limit-storage.budget.used)*3/4){
+    if(retained<=(storage.budget.limit-storage.budget.used)*3/4||
+       (measured_projection&&budgeted_projection&&retained<=storage.budget.limit-storage.budget.used)){
       auto reservation=std::make_shared<Reservation>(storage.budget,retained);
       auto encoded=projection_cache&&s.limit?cache(s.table,h,cols,true):nullptr;
       std::vector<Winner> winners;winners.reserve(s.limit);
@@ -1321,6 +1329,7 @@ Result Engine::execute_inner(const Statement& s){
         if(winners.size()<s.limit){winners.push_back(next);std::push_heap(winners.begin(),winners.end(),less);}
         else if(less(next,winners.front())){std::pop_heap(winners.begin(),winners.end(),less);winners.back()=next;std::push_heap(winners.begin(),winners.end(),less);}
       };
+      bool scan_admitted=true;
       if(s.limit&&candidates){
         ++projection_direct;
         for(size_t pos=begin;pos<end;++pos){auto slot=(*candidates)[pos];++projection_scanned;++candidate_slots;bool yes=true;
@@ -1330,7 +1339,7 @@ Result Engine::execute_inner(const Statement& s){
           else yes=matches_slot(slot,meta(s.table,slot));
           if(yes)remember(encoded->keys[slot],slot);
         }
-      }else if(s.limit)for(uint64_t start=0;start<h.slots;start+=4096){
+      }else if(s.limit)for(uint64_t start=0;scan_admitted&&start<h.slots;start+=4096){
         std::array<uint64_t,64> visible{};++bitmap_blocks;
         auto bits=storage.pool.view(s.table+".valid",start/(PAGE*8));
         std::memcpy(visible.data(),bits+(start%(PAGE*8))/8,sizeof(visible));
@@ -1342,13 +1351,30 @@ Result Engine::execute_inner(const Statement& s){
           if(!m.active)return;
           if((compact_projection||(storage.budget.limit==2*1024*1024&&s.limit<=10))&&
              winners.size()==s.limit&&!less(Winner{m.key,slot},winners.front()))return;
+          if(measured_projection&&nonkey_predicates&&m.length>predicate_blob.capacity()){
+            // Reserve a fresh string before scanning. Reuse the exact payload capacity
+            // instead of charging the previous string's geometric growth a second time.
+            std::string().swap(predicate_blob);predicate_memory.reset();
+            const size_t bytes=std::max<size_t>(32,size_t(m.length)+1);
+            if(bytes>storage.budget.limit-storage.budget.used){scan_admitted=false;return;}
+            predicate_memory.emplace(storage.budget,bytes);
+            predicate_blob.reserve(m.length);
+            if(predicate_blob.capacity()+1>bytes){
+              const auto extra=predicate_blob.capacity()+1-bytes;
+              if(extra>storage.budget.limit-storage.budget.used){scan_admitted=false;return;}
+              storage.budget.acquire(extra);predicate_memory->n+=extra;
+            }
+          }
+          if(!scan_admitted)return;
           if(!predicates.empty()&&!matches_slot(slot,m))return;
           remember(m.key,slot);
         };
         each_set_bit(visible,0,count,visit_projection_slot);
       }
       std::sort(winners.begin(),winners.end(),less);
-      bool output_admitted=true;
+      bool output_admitted=scan_admitted;
+      std::shared_ptr<FILE> ranked;
+      const auto winner_count=winners.size();
       if(measured_projection){
         std::string().swap(predicate_blob);predicate_memory.reset();
         size_t longest=0;
@@ -1356,14 +1382,29 @@ Result Engine::execute_inner(const Statement& s){
         // One decoded scalar row, result copy, packed buffer (including
         // growth slack), vector bytes and temporary Value containers.
         const size_t scratch=4*longest+3*128*sizeof(float)+1024+4*cols.size()*sizeof(Value);
-        output_admitted=scratch<=storage.budget.limit-storage.budget.used;
+        const auto available=storage.budget.limit-storage.budget.used;
+        if(scan_admitted&&scratch>available&&scratch<=available+heap_bytes){
+          // Preserve sorted identities while switching from heap to one-row codec
+          // scratch. The file is unbuffered and has the same lifetime as this query.
+          ranked=storage.temporary();
+          require(std::fwrite(winners.data(),sizeof(Winner),winner_count,ranked.get())==winner_count,"identity spill failed");
+          total_spill_bytes+=winner_count*sizeof(Winner);
+          std::rewind(ranked.get());
+          std::vector<Winner>().swap(winners);
+          storage.budget.release(heap_bytes);reservation->n-=heap_bytes;
+        }
+        output_admitted=scan_admitted&&scratch<=storage.budget.limit-storage.budget.used;
         if(output_admitted){storage.budget.acquire(scratch);reservation->n+=scratch;++projection_direct;}
       }
       if(output_admitted){
         if(compact_projection)result.rows=storage.temporary();
         else{result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>();result.memory_rows->reserve(winners.size());}
         std::string packed_projection;
-        for(auto winner:winners){std::vector<Value> values;
+        for(size_t i=0;i<winner_count;++i){
+          Winner winner;
+          if(ranked)require(std::fread(&winner,sizeof(winner),1,ranked.get())==1,"truncated identity spill");
+          else winner=winners[i];
+          std::vector<Value> values;
           if(scalar_values)values=row(s.table,winner.slot,meta(s.table,winner.slot),cols,false);
           std::vector<Value> output;output.reserve(expressions.size());
           for(size_t i=0;i<expressions.size();++i){auto c=selected[i];
@@ -1429,8 +1470,6 @@ Result Engine::execute_inner(const Statement& s){
         cols[preferred].type==Type::Vector && cols[preferred].width==128 &&
         predicates.size()==1 && cols[predicates.front().first].type==Type::Bigint &&
         (s.conditions[0].op=="<"||s.conditions[0].op=="<="||s.conditions[0].op==">"||s.conditions[0].op==">=");
-      if(range_query && repeated_read)
-        storage.pool.start_prefix(s.table+".v"+std::to_string(preferred),(uint64_t(h.slots)+31)/32);
       bool use_zones=false, upper=false, inclusive=false;
       int64_t bound=0;
       if(range_query && h.slots>=64 && storage.budget.limit>=4*1024*1024){
@@ -1466,12 +1505,77 @@ Result Engine::execute_inner(const Statement& s){
       // The most restrictive block proves in O(1) whether any block can be skipped.
       if(range_query && zone_map && zone_map->column==predicates.front().first)
         use_zones=zone_map->empty_block||excludes(zone_map->highest_min,zone_map->lowest_max);
+      if(range_query && repeated_read){
+        // Reserve 32 frames for metadata, matching the prefix policy. Each
+        // 64-slot block of 128D floats occupies at most two vector pages.
+        const size_t frames=storage.pool.frame_capacity();
+        bool fits=false;
+        if(use_zones && frames>32 &&
+           (storage.budget.limit==4*1024*1024 || storage.budget.limit==8*1024*1024)){
+          size_t remaining=(frames-32)/2;
+          fits=true;
+          for(auto [lo,hi]:zone_map->bounds){
+            if(lo>hi || excludes(lo,hi))continue;
+            if(!remaining){fits=false;break;}
+            --remaining;
+          }
+        }
+        if(fits)storage.pool.release_prefix();
+        else storage.pool.start_prefix(s.table+".v"+std::to_string(preferred),(uint64_t(h.slots)+31)/32);
+      }
+      bool use_hash=false;
+      uint32_t needle=0;
+      if(!use_ivf && storage.budget.limit>=4*1024*1024 && predicates.size()==1 &&
+         s.conditions[0].op=="=" && predicates[0].first<64 && cols[predicates[0].first].type==Type::Varchar &&
+         (unsupported_columns & (uint64_t{1}<<predicates[0].first))){
+        const auto col=predicates[0].first;
+        if(hash_column!=col || hash_last_read+1!=statement_number){
+          hash_directory.reset();hash_streak=0;hash_column=col;
+        }
+        hash_last_read=statement_number;
+        if(hash_streak<9)++hash_streak;
+        if(!hash_directory && hash_streak>=9){
+          using Entry=std::pair<uint32_t,SlotId>;
+          const size_t bytes=512+size_t(h.slots)*sizeof(Entry);
+          if(bytes<=(storage.budget.limit-storage.budget.used)/4){
+            auto dir=std::make_unique<HashDirectory>();
+            dir->reservation=std::make_shared<Reservation>(storage.budget,bytes);
+            dir->entries.reserve(h.slots);
+            const auto file=s.table+".s"+std::to_string(col);
+            for(uint64_t start=0;start<h.slots;start+=PAGE/8){
+              const auto page=storage.pool.view(file,start/(PAGE/8));
+              const auto count=std::min<uint64_t>(PAGE/8,h.slots-start);
+              for(size_t i=0;i<count;++i){
+                uint64_t hash;std::memcpy(&hash,page+i*8,8);
+                dir->entries.emplace_back(static_cast<uint32_t>(hash),static_cast<SlotId>(start+i));
+              }
+            }
+            std::sort(dir->entries.begin(),dir->entries.end());
+            hash_directory=std::move(dir);
+          }
+        }
+        if(hash_directory){
+          needle=static_cast<uint32_t>(scalar_hash(predicates[0].second));
+          // A broad 32-bit bucket may still have highly selective 64-bit signatures.
+          const auto& entries=hash_directory->entries;
+          const auto first=std::lower_bound(entries.begin(),entries.end(),std::make_pair(needle,SlotId{0}));
+          const auto last=std::upper_bound(first,entries.end(),std::make_pair(needle,std::numeric_limits<SlotId>::max()));
+          use_hash=static_cast<size_t>(last-first)<=entries.size()/8;
+        }
+      }
       uint64_t accepted_rows=0;uint32_t first_bucket=0,scan_end=last_probes;const char* expand_mode=std::getenv("MVDB_FILTER_EXPAND");
       do {
         for(uint64_t start=0;start<h.slots;start+=4096){std::array<uint64_t,64> candidates{};
-          if(use_ivf){for(uint32_t bi=first_bucket;bi<scan_end;++bi){auto b=buckets[bi];auto list=posting_list(index_base(s.table,h),b);uint64_t loaded=UINT64_MAX;Page page{};for(uint32_t i=0;i<list.count;++i){uint64_t offset=list.offset+uint64_t(i)*4;if(loaded!=offset/PAGE){loaded=offset/PAGE;page=storage.read(list.file,loaded);}uint32_t slot;std::memcpy(&slot,page.data()+offset%PAGE,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
+          if(use_hash){
+            const auto& entries=hash_directory->entries;
+            auto it=std::lower_bound(entries.begin(),entries.end(),std::make_pair(needle,static_cast<SlotId>(start)));
+            for(;it!=entries.end() && it->first==needle && it->second<start+4096;++it){
+              const size_t bit=it->second-start;
+              candidates[bit/64]|=uint64_t{1}<<(bit%64);
+            }
+          }else if(use_ivf){for(uint32_t bi=first_bucket;bi<scan_end;++bi){auto b=buckets[bi];auto list=posting_list(index_base(s.table,h),b);uint64_t loaded=UINT64_MAX;Page page{};for(uint32_t i=0;i<list.count;++i){uint64_t offset=list.offset+uint64_t(i)*4;if(loaded!=offset/PAGE){loaded=offset/PAGE;page=storage.read(list.file,loaded);}uint32_t slot;std::memcpy(&slot,page.data()+offset%PAGE,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
           else candidates.fill(UINT64_MAX);
-          ++bitmap_blocks;auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));for(size_t word=0;word<64;++word){uint64_t bits;std::memcpy(&bits,valid+(start%(PAGE*8))/8+word*8,8);candidates[word]&=bits;}signature_filter(start,candidates);
+          ++bitmap_blocks;auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));for(size_t word=0;word<64;++word){uint64_t bits;std::memcpy(&bits,valid+(start%(PAGE*8))/8+word*8,8);candidates[word]&=bits;}if(!use_hash)signature_filter(start,candidates);
           if(use_zones){
             for(size_t word=0;word<64 && start/64+word<zone_map->bounds.size();++word){
               auto [lo,hi]=zone_map->bounds[start/64+word];

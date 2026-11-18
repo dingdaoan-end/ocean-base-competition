@@ -54,6 +54,14 @@ class Engine {
   Storage storage;
   std::string read_table;
   bool repeated_read=false;
+  struct HashDirectory {
+    std::shared_ptr<void> reservation;
+    std::vector<std::pair<uint32_t,SlotId>> entries;
+  };
+  std::unique_ptr<HashDirectory> hash_directory;
+  uint64_t statement_number=0, hash_last_read=0;
+  size_t hash_column=SIZE_MAX;
+  unsigned hash_streak=0;
   uint64_t unsupported_columns=0;
   struct ZoneMap {
     std::shared_ptr<void> reservation;
