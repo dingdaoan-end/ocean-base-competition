@@ -64,6 +64,13 @@ public:
     ~PageGuard(){reset();}
     void reset(){if(owner){--owner->frames[frame].pins;owner=nullptr;}}
   };
+private:
+  std::vector<PageGuard> prefix_guards;
+  std::string prefix_file;
+  size_t prefix_charge=0;
+public:
+  void release_prefix() noexcept;
+  void start_prefix(const std::string&,size_t pages);
   std::function<void(const std::string&,uint64_t)> before_flush;
   bool transaction_active=false;
   struct ResidentHandle { size_t frame=0; uint64_t version=0; };

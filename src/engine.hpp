@@ -52,6 +52,19 @@ struct Result {
 };
 class Engine {
   Storage storage;
+  std::string read_table;
+  bool repeated_read=false;
+  uint64_t unsupported_columns=0;
+  struct ZoneMap {
+    std::shared_ptr<void> reservation;
+    size_t column=0;
+    std::vector<std::pair<int64_t,int64_t>> bounds;
+    int64_t highest_min=INT64_MIN,lowest_max=INT64_MAX;
+    bool empty_block=false;
+  };
+  std::unique_ptr<ZoneMap> zone_map;
+  void observe_read_table(std::string_view);
+
   bool ann=false;
   uint32_t nprobe=0; // Zero selects the persisted calibration and cost model.
   uint32_t last_probes=0,last_lists=0,last_recommended=0;
@@ -159,7 +172,7 @@ public:
     :storage(std::move(root),budget,std::move(progress)){}
   Result execute(std::string_view sql);
   void set_search_mode(bool approximate)noexcept{ann=approximate;}
-  void close(){select_workspace.reset();read_cache.reset();prepared_vectors.reset();storage.close();}
+  void close(){observe_read_table({});select_workspace.reset();read_cache.reset();prepared_vectors.reset();storage.close();}
   size_t resident_frame_count() const{return storage.pool.resident_page_count();}
   size_t pinned_frame_count() const{return storage.pool.pinned_page_count();}
   size_t resident_frame_bytes() const{return storage.pool.allocated_page_bytes();}

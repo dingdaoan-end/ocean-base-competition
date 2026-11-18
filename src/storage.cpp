@@ -207,6 +207,27 @@ void BufferPool::flush(size_t i) {
     page_write(descriptor(f.file),pages[i].get(),static_cast<off_t>(f.page*PAGE));data_page_write_bytes+=PAGE;f.dirty=false;
   }
 }
+void BufferPool::release_prefix() noexcept {
+  if(!prefix_charge)return;
+  std::vector<PageGuard>().swap(prefix_guards);
+  std::string().swap(prefix_file);
+  budget.release(prefix_charge);
+  prefix_charge=0;
+}
+void BufferPool::start_prefix(const std::string& file,size_t n) {
+  if(prefix_file==file)return;
+  release_prefix();
+  if((budget.limit!=4*1024*1024 && budget.limit!=8*1024*1024)||transaction_active||frames.size()<=36||n<=frames.size()||extra_reservation)return;
+  const size_t count=frames.size()-32-4;
+  const size_t cost=count*sizeof(PageGuard)+file.size()+128;
+  if(cost+PAGE>budget.limit-budget.used)return;
+  budget.acquire(cost);prefix_charge=cost;
+  try {
+    prefix_guards.reserve(count);
+    for(size_t page=0;page<count;++page)prefix_guards.push_back(lease(file,page));
+    prefix_file=file;
+  }catch(...){release_prefix();throw;}
+}
 size_t BufferPool::pin(const std::string& file,uint64_t page) {
   ++page_accesses;
   auto key=file+":"+std::to_string(page);auto found=lookup.find(key);
@@ -222,6 +243,18 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
     auto& oldest=f.valid&&f.metadata?oldest_metadata:oldest_payload;
     if(oldest==frames.size()||(!f.valid&&frames[oldest].valid)||
        (f.valid==frames[oldest].valid&&f.age<frames[oldest].age))oldest=i;
+  }
+  // At most four replaceable tail frames compete with the non-vector working set.
+  if(!prefix_file.empty()&&file==prefix_file&&page>=prefix_guards.size()){
+    size_t tail=0, head=frames.size();
+    for(size_t i=0;i<frames.size();++i){
+      auto& f=frames[i];
+      if(f.valid&&!f.pins&&f.file==file&&f.page>=prefix_guards.size()){
+        ++tail;
+        if(head==frames.size()||f.age<frames[head].age)head=i;
+      }
+    }
+    if(tail>=4)oldest_payload=head;
   }
   size_t quota=std::min(frames.size()-1,std::max<size_t>(2,frames.size()/2));
   bool replace_metadata=metadata&&protected_count>=quota&&oldest_metadata<frames.size();
